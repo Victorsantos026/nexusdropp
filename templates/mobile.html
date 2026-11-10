@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#6750D6">
+    <title>NexusDrop</title>
+    <style>
+        :root {
+            --primary: #6750d6;
+            --primary-dark: #4f3bb1;
+            --primary-light: #f0edff;
+            --bg: #f7f6fc;
+            --card: #ffffff;
+            --text: #24243a;
+            --muted: #85819a;
+            --border: #e9e6f3;
+            --green: #1d9b72;
+            --green-light: #e5f8f0;
+            --red: #d85269;
+            --shadow: 0 16px 38px rgba(50, 38, 124, .11);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            min-height: 100vh;
+            padding: 16px;
+            color: var(--text);
+            background:
+                radial-gradient(circle at 100% 0%, rgba(103,80,214,.16), transparent 32%),
+                var(--bg);
+            font-family: Poppins, Arial, Helvetica, sans-serif;
+        }
+
+        button, input { font: inherit; }
+        button { border: 0; cursor: pointer; }
+        .app { width: min(100%, 480px); margin: 0 auto; }
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 4px 3px 18px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            color: var(--text);
+            font-size: 18px;
+            font-weight: 800;
+            letter-spacing: -.4px;
+        }
+
+        .brand-icon {
+            width: 27px;
+            height: 27px;
+            color: var(--primary);
+        }
+
+        .online {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            color: var(--green);
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: .3px;
+        }
+
+        .online-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #4cde04;
+            box-shadow: 0 0 0 4px rgba(76,222,4,.14);
+        }
+
+        .hero {
+            position: relative;
+            overflow: hidden;
+            padding: 25px 22px 27px;
+            border-radius: 25px;
+            color: #fff;
+            background: linear-gradient(135deg, #7861ed, #5038b5);
+            box-shadow: 0 17px 36px rgba(82, 58, 183, .25);
+        }
+
+        .hero::after {
+            content: "";
+            position: absolute;
+            width: 190px;
+            height: 190px;
+            right: -78px;
+            top: -92px;
+            border: 1px solid rgba(255,255,255,.22);
+            border-radius: 50%;
+            box-shadow: 0 0 0 22px rgba(255,255,255,.05), 0 0 0 45px rgba(255,255,255,.035);
+        }
+
+        .hero h1, .hero p { position: relative; z-index: 1; }
+        .hero h1 { font-size: 25px; line-height: 1.16; letter-spacing: -.7px; }
+        .hero p { margin-top: 9px; color: rgba(255,255,255,.78); font-size: 12px; line-height: 1.55; }
+
+        .content { display: grid; gap: 13px; margin-top: 14px; }
+        .card { border: 1px solid var(--border); border-radius: 21px; background: var(--card); box-shadow: var(--shadow); }
+
+        .upload-card {
+            padding: 21px 17px 17px;
+            border: 1.5px dashed #aa9bea;
+            text-align: center;
+        }
+
+        .upload-title { font-size: 16px; font-weight: 800; }
+        .upload-subtitle { margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+
+        .primary-button, .secondary-button, .danger-button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            min-height: 42px;
+            border-radius: 12px;
+            padding: 0 16px;
+            font-size: 12px;
+            font-weight: 800;
+            transition: transform .15s ease, background .15s ease, opacity .15s ease;
+        }
+
+        .primary-button:active, .secondary-button:active, .danger-button:active { transform: scale(.97); }
+        .primary-button { color: #fff; background: var(--primary); }
+        .primary-button:hover { background: var(--primary-dark); }
+        .primary-button:disabled { cursor: not-allowed; opacity: .45; }
+        .secondary-button { color: var(--primary); background: var(--primary-light); }
+        .secondary-button:hover { background: #e4dfff; }
+        .danger-button { color: var(--red); background: #fff0f3; }
+
+        .upload-actions { display: flex; justify-content: center; gap: 9px; margin-top: 17px; }
+        #fileInput { display: none; }
+        .icon { width: 17px; height: 17px; flex: 0 0 auto; }
+        .icon-lg { width: 25px; height: 25px; }
+
+        .file-list { display: none; margin-top: 15px; text-align: left; }
+        .file-list.visible { display: block; }
+        .file-list-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 7px; color: var(--muted); font-size: 10px; font-weight: 800; }
+        .file-item { display: flex; align-items: center; gap: 9px; padding: 9px 10px; margin-top: 6px; border-radius: 11px; background: #faf9ff; }
+        .file-type { display: grid; place-items: center; width: 29px; height: 29px; border-radius: 9px; color: var(--primary); background: var(--primary-light); }
+        .file-name { min-width: 0; flex: 1; color: var(--text); font-size: 11px; font-weight: 700; overflow-wrap: anywhere; }
+        .file-size { margin-top: 2px; color: var(--muted); font-size: 9px; font-weight: 500; }
+        .remove-file { display: grid; place-items: center; width: 27px; height: 27px; border-radius: 8px; color: var(--muted); background: transparent; }
+        .remove-file:hover { color: var(--red); background: #fff0f3; }
+
+        .progress-card { display: none; padding: 17px; }
+        .progress-card.visible { display: block; }
+        .progress-head { display: flex; justify-content: space-between; gap: 12px; font-size: 11px; }
+        .progress-head strong { color: var(--text); }
+        .progress-head span { color: var(--primary); font-weight: 800; }
+        .track { height: 8px; margin-top: 11px; overflow: hidden; border-radius: 999px; background: #ebe9f5; }
+        .fill { width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #6d55df, #b16fe8); transition: width .18s ease; }
+        .progress-foot { display: flex; justify-content: space-between; margin-top: 8px; color: var(--muted); font-size: 10px; }
+
+        .status-card { display: flex; align-items: center; gap: 12px; padding: 16px; }
+        .status-icon { display: grid; place-items: center; width: 41px; height: 41px; flex: 0 0 auto; border-radius: 13px; color: var(--green); background: var(--green-light); }
+        .status-icon.error { color: var(--red); background: #fff0f3; }
+        .status-card h2 { font-size: 13px; }
+        .status-card p { margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+
+        .pc-files-card { padding: 17px; }
+        .pc-files-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .pc-files-head h2 { font-size: 14px; }
+        .pc-files-head p { margin-top: 4px; color: var(--muted); font-size: 10px; }
+        .refresh-button { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; color: var(--primary); background: var(--primary-light); }
+        .refresh-button:active { transform: rotate(25deg) scale(.95); }
+        .pc-files-state { padding: 15px 0 3px; color: var(--muted); font-size: 10px; text-align: center; }
+        .pc-file-row { display: flex; align-items: center; gap: 9px; margin-top: 9px; padding: 10px; border-radius: 12px; background: #faf9ff; }
+        .pc-file-info { min-width: 0; flex: 1; }
+        .pc-file-name { color: var(--text); font-size: 11px; font-weight: 800; overflow-wrap: anywhere; }
+        .pc-file-meta { margin-top: 3px; color: var(--muted); font-size: 9px; }
+        .download-button { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; min-height: 32px; padding: 0 9px; border-radius: 9px; color: #fff; background: var(--primary); font-size: 10px; font-weight: 800; text-decoration: none; }
+        .download-button:active { background: var(--primary-dark); }
+
+        .tips { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+        .tip { padding: 12px 8px; border: 1px solid var(--border); border-radius: 15px; background: rgba(255,255,255,.7); text-align: center; }
+        .tip strong { display: block; color: var(--primary); }
+        .tip span { display: block; margin-top: 5px; color: var(--muted); font-size: 9px; line-height: 1.3; }
+        .footer { padding: 14px 0 3px; color: #aaa6bd; font-size: 9px; text-align: center; }
+        .shake { animation: shake .35s ease; }
+        @keyframes shake { 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
+
+        @media (max-width: 360px) {
+            body { padding: 12px; }
+            .hero { padding: 22px 18px 24px; }
+            .hero h1 { font-size: 22px; }
+            .upload-actions { flex-direction: column; }
+            .upload-actions button { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <svg aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden">
+        <symbol id="i-nexus" viewBox="0 0 24 24"><path d="M4 16.5 12 4l8 12.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/><path d="m7 13 5 7 5-7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4m0 0L7 9m5-5 5 5M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4l2 2h7A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v5m4-5v5M9 7V4h6v3m-9 0 1 13h10l1-13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4.5 4.5L19 7" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-close" viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+        <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="8" cy="9" r="1.5" fill="currentColor"/><path d="m5 17 4-4 3 3 2-2 5 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+        <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M14 3v5h5M9 13h6m-6 4h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+        <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="m16 10 5-3v10l-5-3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+        <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M3 8.5a14 14 0 0 1 18 0M6 12a9.5 9.5 0 0 1 12 0m-9 3.5a5 5 0 0 1 6 0M12 19h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+        <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+        <symbol id="i-lightning" viewBox="0 0 24 24"><path d="m13 2-9 12h7l-1 8 9-12h-7z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+        <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.8-4L3 10m0-5v5h5M4 13a8 8 0 0 0 14.8 4L21 14m0 5v-5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+        <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m0 0-4-4m4 4 4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    </svg>
+
+    <main class="app">
+        <header class="topbar">
+            <div class="brand"><span>NexusDrop</span></div>
+            <div class="online"><i class="online-dot"></i> SERVIDOR ONLINE</div>
+        </header>
+
+        <section class="hero">
+            <h1>Envie seus arquivos<br>para o computador</h1>
+            <p>Fotos, vídeos e documentos em qualidade original,<br>direto do iPhone pela rede local.</p>
+        </section>
+
+        <section class="content">
+            <section class="card upload-card" id="uploadCard">
+                <div class="upload-title">Escolha os arquivos para enviar</div>
+                <div class="upload-subtitle">Selecione fotos, vídeos ou documentos. Eles serão salvos diretamente no computador.</div>
+                <input id="fileInput" type="file" accept="*/*" multiple>
+                <div class="upload-actions">
+                    <button class="secondary-button" id="chooseButton" type="button"><svg class="icon"><use href="#i-folder"></use></svg>Escolher arquivos</button>
+                    <button class="primary-button" id="sendButton" type="button" disabled><svg class="icon"><use href="#i-upload"></use></svg>Enviar agora</button>
+                </div>
+                <div class="file-list" id="fileList">
+                    <div class="file-list-header"><span id="fileSummary">0 arquivos</span><button class="danger-button" id="clearButton" type="button">Limpar seleção</button></div>
+                    <div id="fileItems"></div>
+                </div>
+            </section>
+
+            <section class="card progress-card" id="progressCard">
+                <div class="progress-head"><strong id="progressText">Preparando envio...</strong><span id="percentText">0%</span></div>
+                <div class="track"><div class="fill" id="progressFill"></div></div>
+                <div class="progress-foot"><span id="fileCountText">0 arquivos</span><span id="speedText">0 MB/s</span></div>
+            </section>
+
+            <section class="card status-card" id="statusCard">
+                <div class="status-icon" id="statusIcon"><svg class="icon-lg"><use href="#i-check"></use></svg></div>
+                <div><h2 id="statusTitle">Pronto para receber</h2><p id="statusMessage">Selecione arquivos para começar uma transferência.</p></div>
+            </section>
+
+            <section class="card pc-files-card">
+                <div class="pc-files-head">
+                    <div><h2>Arquivos do computador</h2><p>Baixe neste iPhone os arquivos preparados para esta sessão.</p></div>
+                    <button class="refresh-button" id="refreshPcFiles" type="button" aria-label="Atualizar arquivos"><svg class="icon"><use href="#i-refresh"></use></svg></button>
+                </div>
+                <div class="pc-files-state" id="pcFilesState">Verificando arquivos disponíveis...</div>
+                <div id="pcFilesList"></div>
+            </section>
+
+            <section class="tips">
+                <div class="tip"><strong><svg class="icon"><use href="#i-lock"></use></svg></strong><span>Rede local<br>segura</span></div>
+                <div class="tip"><strong><svg class="icon"><use href="#i-image"></use></svg></strong><span>Fotos, vídeos<br>e documentos</span></div>
+                <div class="tip"><strong><svg class="icon"><use href="#i-lightning"></use></svg></strong><span>Envio<br>rápido</span></div>
+            </section>
+        </section>
+        <footer class="footer">Conectado ao computador pela rede Wi-Fi local</footer>
+    </main>
+
+    <script>
+        const input = document.getElementById("fileInput");
+        const chooseButton = document.getElementById("chooseButton");
+        const sendButton = document.getElementById("sendButton");
+        const clearButton = document.getElementById("clearButton");
+        const fileList = document.getElementById("fileList");
+        const fileItems = document.getElementById("fileItems");
+        const fileSummary = document.getElementById("fileSummary");
+        const uploadCard = document.getElementById("uploadCard");
+        const progressCard = document.getElementById("progressCard");
+        const progressFill = document.getElementById("progressFill");
+        const progressText = document.getElementById("progressText");
+        const percentText = document.getElementById("percentText");
+        const fileCountText = document.getElementById("fileCountText");
+        const speedText = document.getElementById("speedText");
+        const statusIcon = document.getElementById("statusIcon");
+        const statusTitle = document.getElementById("statusTitle");
+        const statusMessage = document.getElementById("statusMessage");
+        const pcFilesState = document.getElementById("pcFilesState");
+        const pcFilesList = document.getElementById("pcFilesList");
+        const refreshPcFiles = document.getElementById("refreshPcFiles");
+        let selectedFiles = [];
+        let currentXhr = null;
+
+        const formatBytes = bytes => {
+            if (!bytes) return "0 KB";
+            const units = ["B", "KB", "MB", "GB"];
+            const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+            return `${(bytes / Math.pow(1024, index)).toFixed(index ? 1 : 0)} ${units[index]}`;
+        };
+
+        function setStatus(title, message, type = "ok") {
+            statusTitle.textContent = title;
+            statusMessage.textContent = message;
+            statusIcon.className = `status-icon ${type === "error" ? "error" : ""}`;
+            statusIcon.innerHTML = `<svg class="icon-lg"><use href="#${type === "error" ? "i-close" : "i-check"}></use></svg>`;
+        }
+
+        function reportProgress(active, percent, speed = "0 MB/s") {
+            fetch("/transfer-status", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ active, percent, speed, files: selectedFiles.length, name: selectedFiles.map(file => file.name).join(", ") })
+            }).catch(() => {});
+        }
+
+        function renderFiles() {
+            fileItems.innerHTML = "";
+            const total = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+            fileSummary.textContent = `${selectedFiles.length} arquivo(s) • ${formatBytes(total)}`;
+            fileList.classList.toggle("visible", selectedFiles.length > 0);
+            sendButton.disabled = selectedFiles.length === 0;
+            selectedFiles.forEach((file, index) => {
+                const item = document.createElement("div");
+                item.className = "file-item";
+                const icon = file.type.startsWith("video/") ? "i-video" : file.type.startsWith("image/") ? "i-image" : "i-file";
+                item.innerHTML = `<div class="file-type"><svg class="icon"><use href="#${icon}"></use></svg></div><div class="file-name">${file.name}<div class="file-size">${formatBytes(file.size)}</div></div><button class="remove-file" type="button" aria-label="Remover arquivo"><svg class="icon"><use href="#i-close"></use></svg></button>`;
+                item.querySelector("button").addEventListener("click", () => {
+                    selectedFiles.splice(index, 1);
+                    renderFiles();
+                });
+                fileItems.appendChild(item);
+            });
+        }
+
+        function loadPcFiles() {
+            fetch("/pc-files", { cache: "no-store" })
+                .then(response => response.json())
+                .then(data => {
+                    pcFilesList.innerHTML = "";
+                    const files = data.files || [];
+                    pcFilesState.textContent = files.length ? `${files.length} arquivo(s) disponível(is) no computador` : "Nenhum arquivo preparado pelo computador ainda.";
+                    files.forEach(file => {
+                        const row = document.createElement("div");
+                        row.className = "pc-file-row";
+                        const icon = document.createElement("div");
+                        icon.className = "file-type";
+                        icon.innerHTML = `<svg class="icon"><use href="#i-download"></use></svg>`;
+                        const info = document.createElement("div");
+                        info.className = "pc-file-info";
+                        const name = document.createElement("div");
+                        name.className = "pc-file-name";
+                        name.textContent = file.name;
+                        const meta = document.createElement("div");
+                        meta.className = "pc-file-meta";
+                        meta.textContent = `${formatBytes(file.size)} • ${file.modified}`;
+                        info.append(name, meta);
+                        const link = document.createElement("a");
+                        link.className = "download-button";
+                        link.href = "/download/" + encodeURIComponent(file.name);
+                        link.download = file.name;
+                        link.innerHTML = `<svg class="icon"><use href="#i-download"></use></svg>Baixar`;
+                        row.append(icon, info, link);
+                        pcFilesList.appendChild(row);
+                    });
+                })
+                .catch(() => { pcFilesState.textContent = "Não foi possível consultar o computador."; });
+        }
+
+        refreshPcFiles.addEventListener("click", loadPcFiles);
+        loadPcFiles();
+        setInterval(loadPcFiles, 5000);
+
+        chooseButton.addEventListener("click", () => input.click());
+        input.addEventListener("change", () => {
+            selectedFiles = [...input.files];
+            renderFiles();
+            if (selectedFiles.length) setStatus("Arquivos prontos", "Confira a lista e toque em Enviar agora.");
+        });
+        clearButton.addEventListener("click", () => {
+            selectedFiles = [];
+            input.value = "";
+            renderFiles();
+            setStatus("Pronto para receber", "Selecione arquivos para começar uma transferência.");
+        });
+
+        sendButton.addEventListener("click", () => {
+            if (!selectedFiles.length || currentXhr) return;
+            const formData = new FormData();
+            selectedFiles.forEach(file => formData.append("file", file));
+            currentXhr = new XMLHttpRequest();
+            currentXhr.open("POST", "/", true);
+            progressCard.classList.add("visible");
+            setStatus("Enviando arquivos...", "Não feche esta tela durante a transferência.");
+            progressFill.style.width = "0%";
+            percentText.textContent = "0%";
+            fileCountText.textContent = `${selectedFiles.length} arquivo(s)`;
+            reportProgress(true, 0);
+            let lastTime = Date.now();
+            let lastLoaded = 0;
+            currentXhr.upload.onprogress = event => {
+                if (!event.lengthComputable) return;
+                const percent = Math.round(event.loaded / event.total * 100);
+                progressFill.style.width = `${percent}%`;
+                percentText.textContent = `${percent}%`;
+                const now = Date.now();
+                const seconds = (now - lastTime) / 1000;
+                let speed = speedText.textContent;
+                if (seconds > .3) {
+                    speed = `${((event.loaded - lastLoaded) / seconds / 1024 / 1024).toFixed(1)} MB/s`;
+                    speedText.textContent = speed;
+                    lastTime = now;
+                    lastLoaded = event.loaded;
+                }
+                progressText.textContent = `Enviando ${selectedFiles.length} arquivo(s)`;
+                reportProgress(true, percent, speed);
+            };
+            currentXhr.onload = () => {
+                if (currentXhr.status === 200) {
+                    progressFill.style.width = "100%";
+                    percentText.textContent = "100%";
+                    progressText.textContent = "Transferência concluída";
+                    speedText.textContent = "Concluído";
+                    reportProgress(false, 100, "Concluído");
+                    setStatus("Arquivos recebidos!", "Tudo foi salvo no computador com sucesso.");
+                    selectedFiles = [];
+                    input.value = "";
+                    renderFiles();
+                } else {
+                    setStatus("Não foi possível enviar", "Verifique a conexão e tente novamente.", "error");
+                }
+                currentXhr = null;
+            };
+            currentXhr.onerror = () => {
+                reportProgress(false, 0, "Falha");
+                setStatus("Falha na conexão", "Confira se o iPhone e o computador estão na mesma rede Wi-Fi.", "error");
+                uploadCard.classList.add("shake");
+                setTimeout(() => uploadCard.classList.remove("shake"), 400);
+                currentXhr = null;
+            };
+            currentXhr.send(formData);
+        });
+    </script>
+</body>
+</html>
