@@ -1244,18 +1244,6 @@ class ProfessionalApp(ctk.CTk):
             self.pc_send_bar.set(1 if copied else 0)
         self.show_notice(f"{copied} arquivo(s) disponível(is) no dispositivo")
 
-    def copy_url(self):
-        if not PUBLIC_URL:
-            self.show_notice("Endereço local indisponível")
-            return
-        self.clipboard_clear(); self.clipboard_append(self.url_text); self.update(); self.show_notice("Endereço copiado")
-
-    def open_mobile_local(self):
-        if not PUBLIC_URL:
-            self.show_notice("Endereço local indisponível")
-            return
-        import webbrowser; webbrowser.open(self.url_text); self.show_notice("Página mobile aberta no navegador")
-
     def export_history(self):
         target=filedialog.asksaveasfilename(title="Exportar histórico",defaultextension=".txt",filetypes=[("Arquivo de texto","*.txt")])
         if target:
