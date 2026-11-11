@@ -669,122 +669,6 @@ def get_local_ip():
     return "127.0.0.1"
 
 
-def start_windows_mobile_hotspot():
-    """Tenta iniciar o Hotspot Móvel já configurado no Windows sem usar internet."""
-    if os.name != "nt":
-        return False, "O Hotspot Móvel automático está disponível somente no Windows."
-    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
-    if not powershell:
-        return False, "PowerShell não encontrado."
-    script = r'''
-$ErrorActionPreference = "Stop"
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
-[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null
-$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-if ($null -eq $profile) { throw "Nenhuma interface de rede disponível para o Hotspot Móvel." }
-$manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
-$result = $manager.StartTetheringAsync().GetAwaiter().GetResult()
-if ($result.Status -ne 0 -and $result.Status.ToString() -notmatch "Success|AlreadyOn") { throw "O Windows recusou a ativação: $($result.Status)" }
-Write-Output "OK"
-'''
-    try:
-        result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], capture_output=True, text=True, timeout=25, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if result.returncode == 0 and "OK" in result.stdout:
-            return True, "Hotspot Móvel ativado."
-        return False, (result.stderr or result.stdout or "O Windows não ativou o Hotspot Móvel.").strip()[-300:]
-    except Exception as error:
-        return False, str(error)
-
-
-def configure_legacy_windows_hotspot(ssid, password):
-    """Tenta configurar o modo Hosted Network legado quando o adaptador oferece suporte."""
-    if os.name != "nt":
-        return False, "Disponível somente no Windows."
-    if not re.fullmatch(r"[\x20-\x7E]{1,32}", ssid or "") or not re.fullmatch(r"[\x20-\x7E]{8,63}", password or ""):
-        return False, "SSID ou senha incompatível com o Hosted Network."
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        setup = subprocess.run(["netsh", "wlan", "set", "hostednetwork", "mode=allow", f"ssid={ssid}", f"key={password}", "keyUsage=persistent"], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=15, creationflags=flags)
-        start = subprocess.run(["netsh", "wlan", "start", "hostednetwork"], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=15, creationflags=flags)
-        output = (setup.stdout + start.stdout + setup.stderr + start.stderr).lower()
-        if start.returncode == 0 and "not support" not in output and "não é possível" not in output and "cannot" not in output:
-            return True, "Rede offline criada automaticamente."
-        return False, (start.stdout or start.stderr or "O adaptador não oferece Hosted Network.").strip()[-300:]
-    except Exception as error:
-        return False, str(error)
-
-
-def stop_windows_mobile_hotspot():
-    if os.name != "nt":
-        return
-    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
-    if not powershell:
-        return
-    script = r'''
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
-[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null
-$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
-if ($null -ne $profile) {
-  $manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
-  $manager.StopTetheringAsync().GetAwaiter().GetResult() | Out-Null
-}
-'''
-    try:
-        subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], capture_output=True, timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except Exception:
-        pass
-    # Alguns adaptadores usam o Hosted Network legado, que não é desligado
-    # pela API moderna de tethering.
-    try:
-        subprocess.run(["netsh", "wlan", "stop", "hostednetwork"], capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except Exception:
-        pass
-
-
-def detect_hotspot_ip(fallback):
-    """Encontra o IP típico da interface de hotspot do Windows."""
-    if os.name == "nt":
-        try:
-            result = subprocess.run(["ipconfig"], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            ips = re.findall(r"(?:IPv4[^:]*:|Endere[cç]o IPv4[^:]*:)\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})", result.stdout, flags=re.IGNORECASE)
-            for ip in ips:
-                if ip.startswith(("192.168.", "10.", "172.")) and not ip.endswith(".255"):
-                    if ip.startswith("192.168.137.") or ip.endswith(".1"):
-                        return ip
-            for ip in ips:
-                if ip.startswith(("192.168.", "10.", "172.")):
-                    return ip
-        except Exception:
-            pass
-    return fallback
-
-
-def hotspot_has_client(local_ip):
-    """Detecta um cliente na mesma sub-rede do hotspot usando apenas ARP local."""
-    if not local_ip or local_ip == "127.0.0.1":
-        return False
-    prefix = ".".join(local_ip.split(".")[:3]) + "."
-    try:
-        result = subprocess.run(["arp", "-a"], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=4, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        for candidate in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", result.stdout):
-            if candidate.startswith(prefix) and candidate != local_ip and not candidate.endswith(".255"):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def clear_local_arp_cache():
-    """Remove vizinhanças antigas antes de iniciar uma sessão offline."""
-    if os.name != "nt":
-        return
-    try:
-        subprocess.run(["arp", "-d", "*"], capture_output=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except Exception:
-        pass
-
 class ServerThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
@@ -848,17 +732,8 @@ class ProfessionalApp(ctk.CTk):
         self.animation_step = 0
         self.qr_complete_items = []
         self.received_action_rows = []
-        self.offline_hotspot_started = False
-        self.offline_stage = "network"
-        self.offline_status = "Preparando a rede privada do computador..."
-        self.offline_ssid = f"NexusDrop-Offline-{secrets.token_hex(2).upper()}"
-        self.offline_password = f"Nexus-{secrets.token_urlsafe(10)}"
-        self.offline_started_at = 0
-        self.offline_app_started_at = 0
         self.current_page = "overview"
         self.nav_buttons = {}
-        # Cada execução começa com um pareamento novo; a sessão anterior não
-        # deve impedir a etapa de conexão à rede privada.
         self.session = {}
         save_session({})
         self.build_shell()
@@ -866,54 +741,8 @@ class ProfessionalApp(ctk.CTk):
         self.update_clock()
         self.poll_server_state()
         self.poll_local_url()
-        self.after(350, self.bootstrap_offline_network)
-        self.after(1500, self.poll_offline_connection)
 
-    def bootstrap_offline_network(self):
-        """Cria a rede privada sem bloquear a interface gráfica."""
-        if self.offline_hotspot_started:
-            return
-        threading.Thread(target=self._offline_network_worker, daemon=True, name="NexusDropOfflineNetwork").start()
-
-    def _offline_network_worker(self):
-        clear_local_arp_cache()
-        ok, message = configure_legacy_windows_hotspot(self.offline_ssid, self.offline_password)
-        if ok:
-            self.after(0, lambda: self.offline_network_ready(message))
-        else:
-            self.after(0, lambda: self.offline_network_failed(message))
-
-    def offline_network_ready(self, message):
-        self.offline_hotspot_started = True
-        self.offline_started_at = time.time()
-        clear_local_arp_cache()
-        self.local_ip = detect_hotspot_ip(self.local_ip)
-        self.offline_status = f"Rede privada ativa: {self.offline_ssid}"
-        self._refresh_local_url()
-        if self.current_page in ("overview", "connection"):
-            self.render_overview() if self.current_page == "overview" else self.render_connection()
-
-    def offline_network_failed(self, message):
-        self.offline_status = "O adaptador não permitiu criar a rede automaticamente. Use o botão de configuração do Windows."
-        if self.current_page in ("overview", "connection"):
-            self.render_overview() if self.current_page == "overview" else self.render_connection()
-
-    def poll_offline_connection(self):
-        global LAST_DEVICE_HEARTBEAT
-        app_wait = time.time() - self.offline_app_started_at if self.offline_app_started_at else 0
-        if self.offline_stage == "app" and app_wait >= 25 and (not LAST_DEVICE_HEARTBEAT or time.time() - LAST_DEVICE_HEARTBEAT > 12):
-            self.reset_offline_pairing("O dispositivo saiu da rede privada. Conecte-o novamente para continuar.")
-        stable_for = time.time() - self.offline_started_at if self.offline_started_at else 0
-        if self.offline_hotspot_started and self.offline_stage == "network" and stable_for >= 8 and hotspot_has_client(self.local_ip):
-            self.offline_stage = "app"
-            self.offline_app_started_at = time.time()
-            self.offline_status = "Dispositivo conectado à rede privada. Escaneie o QR Code de acesso."
-            self._refresh_local_url()
-            if self.current_page in ("overview", "connection"):
-                self.render_overview() if self.current_page == "overview" else self.render_connection()
-        self.after(1500, self.poll_offline_connection)
-
-    def reset_offline_pairing(self, message="Conecte o dispositivo à rede privada do computador."):
+    def reset_pairing(self, message="Escaneie o QR Code para conectar o dispositivo."):
         global ACTIVE_DEVICE_TOKEN, ACCESS_TOKEN_USED, LAST_DEVICE_HEARTBEAT, LAST_PHONE_SEEN
         AUTHORIZED_DEVICES.clear()
         ACTIVE_DEVICE_TOKEN = None
@@ -923,10 +752,7 @@ class ProfessionalApp(ctk.CTk):
         rotate_access_token()
         save_session({})
         self.session = {}
-        self.offline_stage = "network"
-        self.offline_app_started_at = 0
-        self.offline_status = message
-        clear_local_arp_cache()
+        self.connection_status = message
         self._refresh_local_url()
         if self.current_page in ("overview", "connection"):
             self.render_overview() if self.current_page == "overview" else self.render_connection()
@@ -968,8 +794,6 @@ class ProfessionalApp(ctk.CTk):
                         os.remove(os.path.join(folder, name))
             except OSError:
                 pass
-        if getattr(self, "offline_hotspot_started", False):
-            stop_windows_mobile_hotspot()
         self.destroy()
 
     def font(self, size=12, weight="normal"):
@@ -1183,21 +1007,20 @@ class ProfessionalApp(ctk.CTk):
         if self.session.get("connected"):
             self.create_connected_card(card)
             return
-        network_stage = self.offline_stage == "network"
-        qr_target = f"WIFI:T:WPA;S:{self.offline_ssid};P:{self.offline_password};;" if network_stage else self.url_text
-        ctk.CTkLabel(card,text="1  CONECTE O DISPOSITIVO À REDE" if network_stage else "2  ABRA O NEXUSDROP",text_color=self.colors["muted"],font=self.font(10,"bold")).pack(anchor="w",padx=22,pady=(20,3))
-        ctk.CTkLabel(card,text="Escaneie para conectar ao PC" if network_stage else "Escaneie para abrir a transferência",text_color=self.colors["text"],font=self.font(18,"bold")).pack(anchor="w",padx=22)
-        ctk.CTkLabel(card,text=self.offline_status if network_stage else "O dispositivo já está na rede privada do computador.",text_color=self.colors["muted"],font=self.font(11),wraplength=400,justify="left").pack(anchor="w",padx=22,pady=(3,7))
+        qr_target = self.url_text
+        ctk.CTkLabel(card,text="CONECTE O DISPOSITIVO",text_color=self.colors["muted"],font=self.font(10,"bold")).pack(anchor="w",padx=22,pady=(20,3))
+        ctk.CTkLabel(card,text="Escaneie para abrir a transferência",text_color=self.colors["text"],font=self.font(18,"bold")).pack(anchor="w",padx=22)
+        ctk.CTkLabel(card,text="Conecte o dispositivo à mesma rede local do computador e escaneie este QR Code.",text_color=self.colors["muted"],font=self.font(11),wraplength=400,justify="left").pack(anchor="w",padx=22,pady=(3,7))
         self.qr_stage=ctk.CTkFrame(card,width=190,height=190,fg_color="#FFFFFF",corner_radius=12); self.qr_stage.pack(pady=(0,3)); self.qr_stage.pack_propagate(False)
         self.qr_canvas=Canvas(self.qr_stage,width=190,height=190,bg="#FFFFFF",highlightthickness=0); self.qr_canvas.pack()
         self.qr_loading_label = ctk.CTkLabel(self.qr_stage, text="", fg_color="transparent")
         self.qr_loading_label.place(relx=0.5, rely=0.5, anchor="center")
-        if self.network_online is not False and not network_stage:
+        if self.network_online is not False:
             self.start_frames(self.qr_loading_label, self.load_qr_gif_frames(178), f"{id(self.qr_loading_label)}:qr", 70)
         qr=ImageTk.PhotoImage(qrcode.make(qr_target).resize((108,108), Image.Resampling.NEAREST)); self.qr_photo=qr
         self.qr_image_id=self.qr_canvas.create_image(95,95,image=qr); self.qr_arc=self.qr_canvas.create_arc(7,7,183,183,start=0,extent=300,style="arc",width=4,outline=self.colors["blue"],state="hidden")
-        self.qr_status=ctk.CTkLabel(card,text="Aguardando conexão à rede..." if network_stage else "Aguardando acesso...",text_color=self.colors["blue"],font=self.font(10,"bold"),wraplength=270,justify="center"); self.qr_status.pack(pady=(0,3))
-        ctk.CTkLabel(card,text="1. Conecte à rede  •  2. Escaneie para abrir" if network_stage else "🔒 Acesso local protegido por token",text_color=self.colors["green"],font=self.font(10,"bold"),wraplength=360,justify="center").pack(pady=(0,10))
+        self.qr_status=ctk.CTkLabel(card,text="Aguardando acesso...",text_color=self.colors["blue"],font=self.font(10,"bold"),wraplength=270,justify="center"); self.qr_status.pack(pady=(0,3))
+        ctk.CTkLabel(card,text="🔒 Acesso local protegido por token",text_color=self.colors["green"],font=self.font(10,"bold"),wraplength=360,justify="center").pack(pady=(0,10))
 
     def create_connected_card(self, card):
         ctk.CTkLabel(card, text="DISPOSITIVO CONECTADO", text_color=self.colors["green"], font=self.font(10, "bold")).pack(anchor="w", padx=22, pady=(28, 5))
@@ -1211,7 +1034,7 @@ class ProfessionalApp(ctk.CTk):
         ctk.CTkButton(card, text="Reconectar dispositivo", width=190, height=36, fg_color=self.colors["blue"], hover_color=self.colors["blue_dark"], font=self.font(10, "bold"), command=self.reconnect).pack(pady=(18, 22))
 
     def reconnect(self):
-        self.reset_offline_pairing("Reconexão iniciada. Conecte o dispositivo à rede privada.")
+        self.reset_pairing("Reconexão iniciada. Escaneie o QR Code novamente.")
 
     def create_activity_card(self,parent,column):
         card=self.make_card(parent); card.grid(row=0,column=column,sticky="nsew",padx=(10,0))
@@ -1322,8 +1145,7 @@ class ProfessionalApp(ctk.CTk):
         self.current_page="tools"; self.clear_content(); self.page_header("Ferramentas","Ações úteis para administrar sua estação.")
         body=ctk.CTkFrame(self.content,fg_color="transparent"); body.grid(row=1,column=0,sticky="nsew",padx=31,pady=(0,25)); body.grid_columnconfigure(0,weight=1); body.grid_columnconfigure(1,weight=1)
         tools=[("Abrir pasta de recebidos","Acessar imediatamente o diretório atual",self.open_folder,self.colors["blue"]),("Exportar histórico","Salvar os registros em um arquivo TXT",self.export_history,self.colors["orange"]),
-                 ("Enviar arquivos para o dispositivo","Escolher arquivos do PC para baixar no dispositivo",self.add_files_for_device,self.colors["coral"]),
-                 ("Modo Seguro Offline","Criar uma rede Wi-Fi privada pelo PC, sem internet",self.open_offline_mode,self.colors["green"])]
+                 ("Enviar arquivos para o dispositivo","Escolher arquivos do PC para baixar no dispositivo",self.add_files_for_device,self.colors["coral"])]
         for i,(title,desc,action,color) in enumerate(tools):
             card=self.make_card(body); card.grid(row=i//2,column=i%2,sticky="ew",padx=6,pady=6)
             ctk.CTkLabel(card,text=title,text_color=self.colors["text"],font=self.font(14,"bold")).pack(anchor="w",padx=18,pady=(18,5))
@@ -1434,92 +1256,6 @@ class ProfessionalApp(ctk.CTk):
             return
         import webbrowser; webbrowser.open(self.url_text); self.show_notice("Página mobile aberta no navegador")
 
-    def open_hotspot_settings(self):
-        if os.name != "nt":
-            self.show_notice("Disponível somente no Windows")
-            return
-        try:
-            os.startfile("ms-settings:network-mobilehotspot")
-        except Exception as error:
-            self.show_notice(f"Não foi possível abrir as configurações: {error}")
-
-    def start_offline_mode(self, ssid_entry, password_entry, window, status_label, automatic=False):
-        ssid = ssid_entry.get().strip()
-        password = password_entry.get().strip()
-        if not ssid or len(password) < 8:
-            status_label.configure(text="Informe o nome da rede e uma senha WPA2 com pelo menos 8 caracteres.", text_color=self.colors["coral"])
-            return
-        status_label.configure(text="Ativando o Hotspot Móvel do Windows...", text_color=self.colors["blue"])
-        window.update_idletasks()
-        ok, message = configure_legacy_windows_hotspot(ssid, password)
-        if not ok:
-            if automatic:
-                status_label.configure(text="Este adaptador não permite configurar SSID e senha automaticamente.\nAbra as configurações do Windows, defina esses dados e clique novamente.", text_color=self.colors["coral"])
-                return
-            # Em drivers modernos o Hosted Network foi removido; nesse caso o
-            # Windows só permite iniciar o hotspot já configurado no sistema.
-            ok, message = start_windows_mobile_hotspot()
-        if not ok:
-            status_label.configure(text=f"Ativação automática indisponível neste adaptador.\n{message}\nAbra as configurações e ative o Hotspot Móvel.", text_color=self.colors["coral"])
-            return
-        self.offline_hotspot_started = True
-        time.sleep(1.0)
-        self.local_ip = detect_hotspot_ip(self.local_ip)
-        global PUBLIC_BASE_URL, PUBLIC_URL
-        PUBLIC_BASE_URL = f"http://{self.local_ip}:5000"
-        PUBLIC_URL = f"{PUBLIC_BASE_URL}/?access={ACCESS_TOKEN}"
-        self.url_text = PUBLIC_URL
-        wifi_payload = f"WIFI:T:WPA;S:{ssid};P:{password};;"
-        try:
-            wifi_image = qrcode.make(wifi_payload).convert("RGB").resize((210, 210), Image.Resampling.NEAREST)
-            app_image = qrcode.make(PUBLIC_URL).convert("RGB").resize((210, 210), Image.Resampling.NEAREST)
-            wifi_photo = ctk.CTkImage(light_image=wifi_image, dark_image=wifi_image, size=(210, 210))
-            app_photo = ctk.CTkImage(light_image=app_image, dark_image=app_image, size=(210, 210))
-            for child in window.winfo_children():
-                child.destroy()
-            ctk.CTkLabel(window, text="Modo Seguro Offline ativo", text_color=self.colors["green"], font=self.font(18, "bold")).pack(pady=(20, 4))
-            ctk.CTkLabel(window, text=f"Rede: {ssid}\nIP local do NexusDrop: {self.local_ip}:5000", text_color=self.colors["muted"], font=self.font(11), justify="center").pack(pady=(0, 12))
-            body = ctk.CTkFrame(window, fg_color="transparent"); body.pack(fill="both", expand=True, padx=20)
-            left = ctk.CTkFrame(body, fg_color="#F7F5FF", corner_radius=12); left.pack(side="left", fill="both", expand=True, padx=(0, 6))
-            ctk.CTkLabel(left, text="1  ENTRAR NA REDE", text_color=self.colors["blue"], font=self.font(11, "bold")).pack(pady=(14, 5))
-            ctk.CTkLabel(left, image=wifi_photo, text="").pack(pady=5)
-            ctk.CTkLabel(left, text="Escaneie com a câmera para conectar o celular ao Wi-Fi do PC.", text_color=self.colors["muted"], font=self.font(9), wraplength=230, justify="center").pack(padx=12, pady=(3, 14))
-            right = ctk.CTkFrame(body, fg_color="#F7F5FF", corner_radius=12); right.pack(side="right", fill="both", expand=True, padx=(6, 0))
-            ctk.CTkLabel(right, text="2  ABRIR NEXUSDROP", text_color=self.colors["blue"], font=self.font(11, "bold")).pack(pady=(14, 5))
-            ctk.CTkLabel(right, image=app_photo, text="").pack(pady=5)
-            ctk.CTkLabel(right, text="Depois de entrar na rede, escaneie este QR Code.", text_color=self.colors["muted"], font=self.font(9), wraplength=230, justify="center").pack(padx=12, pady=(3, 14))
-            window._qr_refs = (wifi_photo, app_photo)
-            ctk.CTkButton(window, text="Fechar", width=130, height=34, fg_color=self.colors["blue"], hover_color=self.colors["blue_dark"], font=self.font(10, "bold"), command=window.destroy).pack(pady=(12, 18))
-            if self.current_page == "overview": self.render_overview()
-            elif self.current_page == "connection": self.render_connection()
-        except Exception as error:
-            status_label.configure(text=f"Não foi possível gerar os QR Codes: {error}", text_color=self.colors["coral"])
-
-    def open_offline_mode(self):
-        window = ctk.CTkToplevel(self)
-        window.title("Modo Seguro Offline — NexusDrop")
-        window.geometry("650x620")
-        window.minsize(620, 580)
-        window.transient(self)
-        window.grab_set()
-        ctk.CTkLabel(window, text="Criar conexão offline", text_color=self.colors["text"], font=self.font(20, "bold")).pack(pady=(22, 4))
-        ctk.CTkLabel(window, text="O celular entrará em uma rede Wi-Fi privada criada pelo Windows, sem internet ou Cloudflare.", text_color=self.colors["muted"], font=self.font(10), wraplength=560, justify="center").pack(pady=(0, 16))
-        form = ctk.CTkFrame(window, fg_color="#F7F5FF", corner_radius=12); form.pack(fill="x", padx=28, pady=5)
-        ctk.CTkLabel(form, text="Use exatamente o nome e a senha configurados no Hotspot Móvel do Windows.", text_color=self.colors["text"], font=self.font(10, "bold"), wraplength=530, justify="left").pack(anchor="w", padx=16, pady=(14, 10))
-        ctk.CTkLabel(form, text="Nome da rede Wi-Fi (SSID)", text_color=self.colors["muted"], font=self.font(10, "bold")).pack(anchor="w", padx=16)
-        ssid_entry = ctk.CTkEntry(form, height=35, placeholder_text="Ex.: NexusDrop-Offline"); ssid_entry.pack(fill="x", padx=16, pady=(4, 10)); ssid_entry.insert(0, "NexusDrop-Offline")
-        ctk.CTkLabel(form, text="Senha da rede Wi-Fi", text_color=self.colors["muted"], font=self.font(10, "bold")).pack(anchor="w", padx=16)
-        password_entry = ctk.CTkEntry(form, height=35, show="•", placeholder_text="Mínimo de 8 caracteres"); password_entry.pack(fill="x", padx=16, pady=(4, 14))
-        generated_ssid = f"NexusDrop-Offline-{secrets.token_hex(2).upper()}"
-        generated_password = f"Nexus-{secrets.token_urlsafe(10)}"
-        ssid_entry.delete(0, "end"); ssid_entry.insert(0, generated_ssid)
-        password_entry.insert(0, generated_password)
-        status = ctk.CTkLabel(window, text="Se ainda não configurou o hotspot, abra as configurações primeiro.", text_color=self.colors["muted"], font=self.font(10), wraplength=560, justify="center"); status.pack(pady=(14, 8))
-        buttons = ctk.CTkFrame(window, fg_color="transparent"); buttons.pack(pady=6)
-        ctk.CTkButton(buttons, text="Abrir configurações do Windows", width=220, height=36, fg_color="#EEEAFD", hover_color="#DED7FA", text_color=self.colors["blue"], font=self.font(10, "bold"), command=self.open_hotspot_settings).pack(side="left", padx=5)
-        ctk.CTkButton(buttons, text="Ativar e gerar QR Codes", width=190, height=36, fg_color=self.colors["blue"], hover_color=self.colors["blue_dark"], font=self.font(10, "bold"), command=lambda: self.start_offline_mode(ssid_entry, password_entry, window, status)).pack(side="left", padx=5)
-        self.after(350, lambda: self.start_offline_mode(ssid_entry, password_entry, window, status, automatic=True))
-
     def export_history(self):
         target=filedialog.asksaveasfilename(title="Exportar histórico",defaultextension=".txt",filetypes=[("Arquivo de texto","*.txt")])
         if target:
@@ -1584,7 +1320,7 @@ class ProfessionalApp(ctk.CTk):
             return False
 
     def update_network_status(self):
-        online = self.offline_hotspot_started or self.is_network_online()
+        online = self.is_network_online()
         changed = online != self.network_online
         self.network_online = online
         if online:

@@ -401,7 +401,7 @@
                 })
                 .catch(() => {
                     // O desktop detectará a ausência após alguns segundos e
-                    // voltará a mostrar o QR Code da rede privada.
+                    // invalidará a sessão local atual.
                 });
         }
         sendPresence();
