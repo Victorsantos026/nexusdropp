@@ -15,6 +15,8 @@ import secrets
 import hmac
 import hashlib
 import qrcode
+import ssl
+from datetime import datetime as dt_datetime, timedelta, timezone
 from PIL import Image, ImageTk, ImageSequence
 from tkinter import filedialog, Canvas
 import time
@@ -25,6 +27,140 @@ import customtkinter as ctk
 # =====================================================
 # CONFIGURAÇÕES DO FLASK E UPLOAD
 # =====================================================
+
+PUBLIC_URL = ""
+PUBLIC_BASE_URL = ""
+PUBLIC_URL_READY = threading.Event()
+CLOUDFLARED_PROCESS = None
+CLOUDFLARED_LOCK = threading.Lock()
+CLOUDFLARE_ERROR = ""
+AUTH_FAILURES = {}
+AUTH_FAILURES_LOCK = threading.Lock()
+AUTH_WINDOW_SECONDS = 60
+AUTH_MAX_FAILURES = 10
+
+
+def cloudflared_path():
+    """Localiza o cloudflared de 64 bits embutido ou ao lado do programa."""
+    filenames = ["cloudflared-win64.exe", "cloudflared.exe"] if os.name == "nt" else ["cloudflared"]
+    root = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    for filename in filenames:
+        embedded = os.path.join(root, filename)
+        if os.path.exists(embedded):
+            return embedded
+    for filename in filenames:
+        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        if os.path.exists(local):
+            return local
+    return None
+
+
+def start_cloudflared():
+    """Inicia o Quick Tunnel sem console e captura a URL HTTPS pública."""
+    global PUBLIC_URL, PUBLIC_BASE_URL, CLOUDFLARED_PROCESS, CLOUDFLARE_ERROR
+    binary = cloudflared_path()
+    if not binary:
+        CLOUDFLARE_ERROR = "cloudflared-win64.exe não foi encontrado"
+        print(CLOUDFLARE_ERROR)
+        PUBLIC_URL_READY.set()
+        return
+
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+
+    try:
+        process = subprocess.Popen(
+            [binary, "tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:5000"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=flags,
+            startupinfo=startupinfo,
+        )
+        with CLOUDFLARED_LOCK:
+            CLOUDFLARED_PROCESS = process
+
+        pattern = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com(?:/)?")
+        output_lines = []
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+            output_lines.append(line.strip())
+            match = pattern.search(line)
+            if match:
+                base_url = match.group(0).rstrip("/")
+                PUBLIC_BASE_URL = base_url
+                PUBLIC_URL = f"{base_url}/?access={ACCESS_TOKEN}"
+                PUBLIC_URL_READY.set()
+                break
+
+        if not PUBLIC_URL_READY.is_set():
+            CLOUDFLARE_ERROR = output_lines[-1] if output_lines else "cloudflared encerrou sem gerar uma URL"
+            PUBLIC_URL_READY.set()
+    except Exception as error:
+        CLOUDFLARE_ERROR = f"Erro no Cloudflare Tunnel: {error}"
+        print(CLOUDFLARE_ERROR)
+        PUBLIC_URL_READY.set()
+
+
+def stop_cloudflared():
+    """Finaliza o túnel sem deixar processo órfão no Windows."""
+    global CLOUDFLARED_PROCESS
+    with CLOUDFLARED_LOCK:
+        process = CLOUDFLARED_PROCESS
+        CLOUDFLARED_PROCESS = None
+    if process and process.poll() is None:
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+def rotate_access_token():
+    """Gera um novo token e invalida qualquer QR Code anterior."""
+    global ACCESS_TOKEN, ACCESS_TOKEN_EXPIRES_AT, ACCESS_TOKEN_USED, PUBLIC_URL
+    ACCESS_TOKEN = secrets.token_urlsafe(32)
+    ACCESS_TOKEN_EXPIRES_AT = time.time() + 120
+    ACCESS_TOKEN_USED = False
+    if PUBLIC_BASE_URL:
+        PUBLIC_URL = f"{PUBLIC_BASE_URL}/?access={ACCESS_TOKEN}"
+
+
+def allow_auth_attempt(client_key):
+    now = time.time()
+    with AUTH_FAILURES_LOCK:
+        attempts = [value for value in AUTH_FAILURES.get(client_key, []) if now - value < AUTH_WINDOW_SECONDS]
+        AUTH_FAILURES[client_key] = attempts
+        return len(attempts) < AUTH_MAX_FAILURES
+
+
+def register_auth_failure(client_key):
+    with AUTH_FAILURES_LOCK:
+        AUTH_FAILURES.setdefault(client_key, []).append(time.time())
+
+
+def csrf_is_valid():
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return True
+    device_token = request.cookies.get(DEVICE_COOKIE, "")
+    session = AUTHORIZED_DEVICES.get(device_token, {})
+    expected = session.get("csrf", "")
+    cookie_value = request.cookies.get("NEXUS_CSRF", "")
+    supplied = request.headers.get("X-Nexus-CSRF", "")
+    return bool(expected and cookie_value and supplied and hmac.compare_digest(expected, cookie_value) and hmac.compare_digest(expected, supplied))
+
 
 # Recursos somente leitura ficam embutidos no onefile do PyInstaller.
 # Dados graváveis ficam fora do executável, em uma pasta persistente do Windows.
@@ -39,26 +175,163 @@ os.makedirs(DATA_DIR, exist_ok=True)
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 app = Flask(__name__, template_folder=TEMPLATES_DIR)
 
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
 # Token temporário desta execução. O IP sozinho não dá acesso ao servidor.
 ACCESS_TOKEN = secrets.token_urlsafe(32)
+ACCESS_TOKEN_EXPIRES_AT = time.time() + 120
+ACCESS_TOKEN_USED = False
 AUTHORIZED_DEVICES = {}
 ACTIVE_DEVICE_TOKEN = None
 DEVICE_COOKIE = "nexus_device"
+SESSION_TTL = 24 * 60 * 60
 
 
 def is_authorized_device():
+    global LAST_DEVICE_HEARTBEAT
+    if not is_mobile_request():
+        return False
     device_token = request.cookies.get(DEVICE_COOKIE, "")
-    return bool(device_token and device_token in AUTHORIZED_DEVICES)
+    session = AUTHORIZED_DEVICES.get(device_token)
+    if not device_token or not session or device_token != ACTIVE_DEVICE_TOKEN:
+        return False
+    if not hmac.compare_digest(session.get("user_agent", ""), user_agent_fingerprint()):
+        return False
+    if time.time() - float(session.get("created_at", 0)) > SESSION_TTL:
+        AUTHORIZED_DEVICES.pop(device_token, None)
+        return False
+    # Qualquer requisição válida confirma que o dispositivo ainda alcança o PC.
+    LAST_DEVICE_HEARTBEAT = time.time()
+    return True
+
+
+def is_mobile_request():
+    """Aceita somente navegadores móveis; computadores continuam bloqueados."""
+    user_agent = request.headers.get("User-Agent", "").lower()
+    return any(value in user_agent for value in ("iphone", "ipod", "ipad", "android", "mobile"))
+
+
+def user_agent_fingerprint():
+    return hashlib.sha256(request.headers.get("User-Agent", "").encode("utf-8")).hexdigest()
 
 
 def valid_access_token():
+    global ACCESS_TOKEN_USED
     supplied = request.args.get("access", "")
-    return bool(supplied and hmac.compare_digest(supplied, ACCESS_TOKEN))
+    client_key = request.remote_addr or "unknown"
+    if not supplied or not allow_auth_attempt(client_key):
+        return False
+    valid = not ACCESS_TOKEN_USED and time.time() <= ACCESS_TOKEN_EXPIRES_AT and hmac.compare_digest(supplied, ACCESS_TOKEN)
+    if not valid:
+        register_auth_failure(client_key)
+    return valid
 
 
-def access_denied():
-    return "Acesso não autorizado. Escaneie o QR Code exibido pelo NexusDrop.", 403
+def create_tls_certificate(ip_address):
+    """Cria uma CA local e um certificado HTTPS assinado por ela."""
+    cert_file = os.path.join(DATA_DIR, "nexusdrop-cert.pem")
+    key_file = os.path.join(DATA_DIR, "nexusdrop-key.pem")
+    ca_cert_file = os.path.join(DATA_DIR, "nexusdrop-ca.pem")
+    ca_key_file = os.path.join(DATA_DIR, "nexusdrop-ca-key.pem")
+    exported_ca = os.path.join(os.path.expanduser("~"), "Desktop", "NexusDrop-CA.cer")
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+        import ipaddress
 
+        def write_ca():
+            ca_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+            ca_subject = x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "BR"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "NexusDrop"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "NexusDrop Local Authority"),
+            ])
+            now = dt_datetime.now(timezone.utc)
+            ca_cert = (
+                x509.CertificateBuilder()
+                .subject_name(ca_subject).issuer_name(ca_subject)
+                .public_key(ca_key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - timedelta(minutes=1))
+                .not_valid_after(now + timedelta(days=3650))
+                .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+                .add_extension(x509.KeyUsage(
+                    digital_signature=False, content_commitment=False,
+                    key_encipherment=False, data_encipherment=False,
+                    key_agreement=False, key_cert_sign=True, crl_sign=True,
+                    encipher_only=False, decipher_only=False
+                ), critical=True)
+                .sign(ca_key, hashes.SHA256())
+            )
+            with open(ca_key_file, "wb") as file:
+                file.write(ca_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption()
+                ))
+            with open(ca_cert_file, "wb") as file:
+                file.write(ca_cert.public_bytes(serialization.Encoding.PEM))
+            return ca_key, ca_cert
+
+        if os.path.exists(ca_key_file) and os.path.exists(ca_cert_file):
+            with open(ca_key_file, "rb") as file:
+                ca_key = serialization.load_pem_private_key(file.read(), password=None)
+            with open(ca_cert_file, "rb") as file:
+                ca_cert = x509.load_pem_x509_certificate(file.read())
+        else:
+            ca_key, ca_cert = write_ca()
+
+        # O .cer é público e pode ser instalado no dispositivo móvel. Nunca exporte o ca_key_file.
+        os.makedirs(os.path.dirname(exported_ca), exist_ok=True)
+        with open(exported_ca, "wb") as file:
+            file.write(ca_cert.public_bytes(serialization.Encoding.DER))
+
+        server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        server_subject = x509.Name([
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "NexusDrop Local"),
+            x509.NameAttribute(NameOID.COMMON_NAME, ip_address),
+        ])
+        now = dt_datetime.now(timezone.utc)
+        server_cert = (
+            x509.CertificateBuilder()
+            .subject_name(server_subject).issuer_name(ca_cert.subject)
+            .public_key(server_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(days=825))
+            .add_extension(x509.SubjectAlternativeName([
+                x509.IPAddress(ipaddress.ip_address(ip_address)),
+                x509.DNSName("localhost")
+            ]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .sign(ca_key, hashes.SHA256())
+        )
+        with open(key_file, "wb") as file:
+            file.write(server_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption()
+            ))
+        with open(cert_file, "wb") as file:
+            file.write(server_cert.public_bytes(serialization.Encoding.PEM))
+        print(f"Certificado CA para instalar no dispositivo móvel: {exported_ca}")
+        return cert_file, key_file
+    except ImportError as error:
+        raise RuntimeError("Instale a dependência HTTPS com: python -m pip install cryptography") from error
+    except Exception as error:
+        raise RuntimeError(f"Não foi possível criar os certificados HTTPS: {error}") from error
 
 # ================= CONTROLE REMOTO OPCIONAL =================
 # Cole somente a URL do projeto e a chave ANON pública.
@@ -126,25 +399,19 @@ def check_remote_control():
 
 
 def check_app_access():
-    control = check_remote_control()
-    if not control.get("active", True):
-        return False, control.get("message") or "O NexusDrop está temporariamente desativado."
-    if control.get("maintenance", False):
-        return False, control.get("message") or "O NexusDrop está em manutenção. Tente novamente mais tarde."
-    minimum = version_tuple(control.get("minimum_version", "0.0.0"))
-    if version_tuple(APP_VERSION) < minimum:
-        return False, control.get("message") or f"Atualize o NexusDrop para a versão {control.get('minimum_version')}."
+    # O modo LAN não consulta Supabase, Cloudflare ou qualquer serviço externo.
     return True, "OK"
 
 
 LAST_PHONE_SEEN = 0
+LAST_DEVICE_HEARTBEAT = 0
 LAST_UPLOAD_TIME = 0
 LAST_UPLOADED_FILE = ""
 TRANSFER_STATE = {"active": False, "percent": 0, "files": 0, "name": "", "speed": "0 MB/s"}
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 SESSION_FILE = os.path.join(DATA_DIR, "session.json")
-UPLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "RecebidosiPhone")
-OUTBOX_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "NexusDrop_Para_iPhone")
+UPLOAD_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "NexusDrop_Recebidos")
+OUTBOX_FOLDER = os.path.join(os.path.expanduser("~"), "Desktop", "NexusDrop_Para_Dispositivo")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTBOX_FOLDER, exist_ok=True)
 
@@ -203,6 +470,17 @@ def add_history(record):
     save_history(records)
 
 
+def access_denied():
+    """Resposta única para rotas acessadas sem token ou sessão autorizada."""
+    response = make_response(jsonify({
+        "ok": False,
+        "error": "Acesso não autorizado. Escaneie o QR Code atual do NexusDrop."
+    }), 403)
+    response.delete_cookie(DEVICE_COOKIE)
+    response.delete_cookie("NEXUS_CSRF")
+    return response
+
+
 @app.route("/assets/<path:filename>")
 def serve_assets(filename):
     return send_from_directory(os.path.join(BASE_DIR, "assets"), filename)
@@ -232,14 +510,18 @@ def pc_files():
 def download_pc_file(filename):
     if not is_authorized_device():
         return access_denied()
-    # Cada dispositivo possui uma pasta própria; ../ continua bloqueado pelo Flask.
-    return send_from_directory(active_device_folder(OUTBOX_FOLDER), filename, as_attachment=True)
+    folder = os.path.realpath(active_device_folder(OUTBOX_FOLDER))
+    safe_name = secure_filename(os.path.basename(filename))
+    target = os.path.realpath(os.path.join(folder, safe_name))
+    if not safe_name or os.path.commonpath([folder, target]) != folder or not os.path.isfile(target):
+        return access_denied()
+    return send_from_directory(folder, safe_name, as_attachment=True)
 
 
 @app.route("/transfer-status", methods=["POST"])
 def transfer_status():
     global TRANSFER_STATE
-    if not is_authorized_device():
+    if not is_authorized_device() or not csrf_is_valid():
         return access_denied()
     data = request.get_json(silent=True) or {}
     TRANSFER_STATE.update({
@@ -251,11 +533,27 @@ def transfer_status():
     })
     return "ok", 200
 
+
+@app.route("/presence", methods=["GET"])
+def device_presence():
+    """Heartbeat leve; confirma que o navegador ainda alcança este PC."""
+    global LAST_DEVICE_HEARTBEAT, LAST_PHONE_SEEN
+    if not is_authorized_device():
+        return access_denied()
+    LAST_DEVICE_HEARTBEAT = time.time()
+    LAST_PHONE_SEEN = LAST_DEVICE_HEARTBEAT
+    return jsonify({"ok": True, "local": True})
+
 @app.route("/", methods=["GET", "POST"])
 def upload_file():
-    global LAST_PHONE_SEEN, LAST_UPLOAD_TIME, LAST_UPLOADED_FILE, ACTIVE_DEVICE_TOKEN
+    global LAST_PHONE_SEEN, LAST_DEVICE_HEARTBEAT, LAST_UPLOAD_TIME, LAST_UPLOADED_FILE, ACTIVE_DEVICE_TOKEN, ACCESS_TOKEN_USED
+    if not is_mobile_request():
+        return access_denied()
+    supplied_access = request.args.get("access", "")
+    if supplied_access and not hmac.compare_digest(supplied_access, ACCESS_TOKEN):
+        return access_denied()
     if request.method == "POST":
-        if not is_authorized_device():
+        if not is_authorized_device() or not csrf_is_valid():
             return access_denied()
         files = request.files.getlist("file")
         if not files:
@@ -274,9 +572,11 @@ def upload_file():
                 counter = 1
                 while os.path.exists(destination):
                     new_filename = f"{name}_{counter}{extension}"
-                    destination = os.path.join(UPLOAD_FOLDER, new_filename)
+                    destination = os.path.join(destination_folder, new_filename)
                     counter += 1
-                file.save(destination)
+                partial_destination = destination + ".part"
+                file.save(partial_destination)
+                os.replace(partial_destination, destination)
                 saved_names.append(os.path.basename(destination))
             LAST_UPLOADED_FILE = ", ".join(saved_names)
             TRANSFER_STATE.update({"active": False, "percent": 100, "files": len(saved_names), "name": LAST_UPLOADED_FILE, "speed": "Concluído"})
@@ -285,12 +585,18 @@ def upload_file():
                 "type": "upload",
                 "files": LAST_UPLOADED_FILE,
                 "ip": request.remote_addr or "desconhecido",
-                "device": request.headers.get("User-Agent", "iPhone"),
+                "device": request.headers.get("User-Agent", "dispositivo móvel"),
                 "time": time.strftime("%d/%m/%Y %H:%M:%S")
             })
             return "Sucesso", 200
         except Exception as error:
-            print("Erro:", error)
+            try:
+                for partial in os.listdir(destination_folder):
+                    if partial.endswith(".part"):
+                        os.remove(os.path.join(destination_folder, partial))
+            except OSError:
+                pass
+            print("Erro ao salvar transferência:", type(error).__name__)
             return "Erro ao salvar", 500
 
     # O IP sozinho não é suficiente: a primeira abertura precisa do token do QR.
@@ -299,50 +605,195 @@ def upload_file():
     device_token = request.cookies.get(DEVICE_COOKIE)
     is_new_device = not device_token or device_token not in AUTHORIZED_DEVICES
     if is_new_device:
-        # Apenas um iPhone fica autorizado por vez nesta estação.
+        # Apenas um dispositivo móvel fica autorizado por vez nesta estação.
         # Isso evita que dois dispositivos compartilhem a mesma fila.
         AUTHORIZED_DEVICES.clear()
+        ACCESS_TOKEN_USED = True
         device_token = secrets.token_urlsafe(32)
+        csrf_token = secrets.token_urlsafe(32)
         AUTHORIZED_DEVICES[device_token] = {
             "ip": request.remote_addr or "desconhecido",
-            "created_at": time.time()
+            "created_at": time.time(),
+            "user_agent": user_agent_fingerprint(),
+            "csrf": csrf_token
         }
         ACTIVE_DEVICE_TOKEN = device_token
     if is_new_device:
         LAST_PHONE_SEEN = time.time()
+        LAST_DEVICE_HEARTBEAT = LAST_PHONE_SEEN
         scan_time = time.strftime("%d/%m/%Y %H:%M:%S")
         save_session({
             "connected": True,
             "ip": request.remote_addr or "desconhecido",
-            "device": request.headers.get("User-Agent", "iPhone"),
+            "device": request.headers.get("User-Agent", "dispositivo móvel"),
             "time": scan_time
         })
         add_history({
             "type": "scan",
             "files": "QR Code reconhecido",
             "ip": request.remote_addr or "desconhecido",
-            "device": request.headers.get("User-Agent", "iPhone"),
+            "device": request.headers.get("User-Agent", "dispositivo móvel"),
             "time": scan_time
         })
-    response = make_response(render_template("mobile.html"))
-    response.set_cookie(DEVICE_COOKIE, device_token, max_age=86400, httponly=True, samesite="Lax")
+    if is_new_device:
+        # Remove o token da barra de endereço depois do pareamento.
+        response = make_response("", 302)
+        response.headers["Location"] = "/"
+    else:
+        response = make_response(render_template("mobile.html"))
+    # O modo LAN usa HTTP local; Secure=True impediria o cookie de circular no dispositivo móvel.
+    response.set_cookie(DEVICE_COOKIE, device_token, max_age=SESSION_TTL, httponly=True, secure=False, samesite="Strict")
+    csrf_token = AUTHORIZED_DEVICES.get(device_token, {}).get("csrf", "")
+    response.set_cookie("NEXUS_CSRF", csrf_token, max_age=SESSION_TTL, httponly=False, secure=False, samesite="Strict")
     return response
 
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
+        # Endereço reservado apenas para selecionar a interface local; nenhum
+        # pacote de aplicação é enviado e não depende de internet.
+        s.connect(("192.0.2.1", 9))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        if not ip.startswith("127."):
+            return ip
     except Exception:
-        return "127.0.0.1"
+        pass
+    try:
+        candidates = socket.gethostbyname_ex(socket.gethostname())[2]
+        for ip in candidates:
+            if "." in ip and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+def start_windows_mobile_hotspot():
+    """Tenta iniciar o Hotspot Móvel já configurado no Windows sem usar internet."""
+    if os.name != "nt":
+        return False, "O Hotspot Móvel automático está disponível somente no Windows."
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        return False, "PowerShell não encontrado."
+    script = r'''
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
+[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null
+$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+if ($null -eq $profile) { throw "Nenhuma interface de rede disponível para o Hotspot Móvel." }
+$manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+$result = $manager.StartTetheringAsync().GetAwaiter().GetResult()
+if ($result.Status -ne 0 -and $result.Status.ToString() -notmatch "Success|AlreadyOn") { throw "O Windows recusou a ativação: $($result.Status)" }
+Write-Output "OK"
+'''
+    try:
+        result = subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], capture_output=True, text=True, timeout=25, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if result.returncode == 0 and "OK" in result.stdout:
+            return True, "Hotspot Móvel ativado."
+        return False, (result.stderr or result.stdout or "O Windows não ativou o Hotspot Móvel.").strip()[-300:]
+    except Exception as error:
+        return False, str(error)
+
+
+def configure_legacy_windows_hotspot(ssid, password):
+    """Tenta configurar o modo Hosted Network legado quando o adaptador oferece suporte."""
+    if os.name != "nt":
+        return False, "Disponível somente no Windows."
+    if not re.fullmatch(r"[\x20-\x7E]{1,32}", ssid or "") or not re.fullmatch(r"[\x20-\x7E]{8,63}", password or ""):
+        return False, "SSID ou senha incompatível com o Hosted Network."
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        setup = subprocess.run(["netsh", "wlan", "set", "hostednetwork", "mode=allow", f"ssid={ssid}", f"key={password}", "keyUsage=persistent"], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=15, creationflags=flags)
+        start = subprocess.run(["netsh", "wlan", "start", "hostednetwork"], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=15, creationflags=flags)
+        output = (setup.stdout + start.stdout + setup.stderr + start.stderr).lower()
+        if start.returncode == 0 and "not support" not in output and "não é possível" not in output and "cannot" not in output:
+            return True, "Rede offline criada automaticamente."
+        return False, (start.stdout or start.stderr or "O adaptador não oferece Hosted Network.").strip()[-300:]
+    except Exception as error:
+        return False, str(error)
+
+
+def stop_windows_mobile_hotspot():
+    if os.name != "nt":
+        return
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        return
+    script = r'''
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+[Windows.Networking.Connectivity.NetworkInformation,Windows.Networking.Connectivity,ContentType=WindowsRuntime] | Out-Null
+[Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager,Windows.Networking.NetworkOperators,ContentType=WindowsRuntime] | Out-Null
+$profile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+if ($null -ne $profile) {
+  $manager = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager]::CreateFromConnectionProfile($profile)
+  $manager.StopTetheringAsync().GetAwaiter().GetResult() | Out-Null
+}
+'''
+    try:
+        subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], capture_output=True, timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+    # Alguns adaptadores usam o Hosted Network legado, que não é desligado
+    # pela API moderna de tethering.
+    try:
+        subprocess.run(["netsh", "wlan", "stop", "hostednetwork"], capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
+def detect_hotspot_ip(fallback):
+    """Encontra o IP típico da interface de hotspot do Windows."""
+    if os.name == "nt":
+        try:
+            result = subprocess.run(["ipconfig"], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            ips = re.findall(r"(?:IPv4[^:]*:|Endere[cç]o IPv4[^:]*:)\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})", result.stdout, flags=re.IGNORECASE)
+            for ip in ips:
+                if ip.startswith(("192.168.", "10.", "172.")) and not ip.endswith(".255"):
+                    if ip.startswith("192.168.137.") or ip.endswith(".1"):
+                        return ip
+            for ip in ips:
+                if ip.startswith(("192.168.", "10.", "172.")):
+                    return ip
+        except Exception:
+            pass
+    return fallback
+
+
+def hotspot_has_client(local_ip):
+    """Detecta um cliente na mesma sub-rede do hotspot usando apenas ARP local."""
+    if not local_ip or local_ip == "127.0.0.1":
+        return False
+    prefix = ".".join(local_ip.split(".")[:3]) + "."
+    try:
+        result = subprocess.run(["arp", "-a"], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=4, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        for candidate in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", result.stdout):
+            if candidate.startswith(prefix) and candidate != local_ip and not candidate.endswith(".255"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def clear_local_arp_cache():
+    """Remove vizinhanças antigas antes de iniciar uma sessão offline."""
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(["arp", "-d", "*"], capture_output=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
 
 class ServerThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
     def run(self):
-        app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
+        try:
+            # Servidor acessível somente pela rede local. Não inicia túnel externo.
+            app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
+        except Exception as error:
+            print(f"Erro ao iniciar o servidor local: {error}")
 
 
 # =====================================================
@@ -356,8 +807,8 @@ class ProfessionalApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
         self.title("NexusDrop")
         self._window_icon = None
-        ico_path = os.path.join(BASE_DIR, "assets", "icone.ico")
-        png_path = os.path.join(BASE_DIR, "assets", "icone.png")
+        ico_path = os.path.join(BASE_DIR, "assets", "icone2.ico")
+        png_path = os.path.join(BASE_DIR, "assets", "icone2.png")
         try:
             if os.path.exists(ico_path):
                 self.iconbitmap(ico_path)
@@ -372,7 +823,12 @@ class ProfessionalApp(ctk.CTk):
         self.minsize(1050, 680)
         self.configure(fg_color="#F5F3FF")
         self.local_ip = get_local_ip()
-        self.url_text = f"http://{self.local_ip}:5000/?access={ACCESS_TOKEN}"
+        global PUBLIC_URL, PUBLIC_BASE_URL
+        PUBLIC_BASE_URL = f"http://{self.local_ip}:5000"
+        PUBLIC_URL = f"{PUBLIC_BASE_URL}/?access={ACCESS_TOKEN}"
+        self.url_text = PUBLIC_URL
+        self.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.tunnel_notice_shown = False
         self.colors = {
             "blue": "#6750D6", "blue_dark": "#4E3CAF", "navy": "#20233F",
             "sidebar": "#20233F", "sidebar_hover": "#343866", "text": "#24243A",
@@ -391,13 +847,130 @@ class ProfessionalApp(ctk.CTk):
         self.last_network_check = 0
         self.animation_step = 0
         self.qr_complete_items = []
+        self.received_action_rows = []
+        self.offline_hotspot_started = False
+        self.offline_stage = "network"
+        self.offline_status = "Preparando a rede privada do computador..."
+        self.offline_ssid = f"NexusDrop-Offline-{secrets.token_hex(2).upper()}"
+        self.offline_password = f"Nexus-{secrets.token_urlsafe(10)}"
+        self.offline_started_at = 0
+        self.offline_app_started_at = 0
         self.current_page = "overview"
         self.nav_buttons = {}
-        self.session = load_session()
+        # Cada execução começa com um pareamento novo; a sessão anterior não
+        # deve impedir a etapa de conexão à rede privada.
+        self.session = {}
+        save_session({})
         self.build_shell()
         self.render_overview()
         self.update_clock()
         self.poll_server_state()
+        self.poll_local_url()
+        self.after(350, self.bootstrap_offline_network)
+        self.after(1500, self.poll_offline_connection)
+
+    def bootstrap_offline_network(self):
+        """Cria a rede privada sem bloquear a interface gráfica."""
+        if self.offline_hotspot_started:
+            return
+        threading.Thread(target=self._offline_network_worker, daemon=True, name="NexusDropOfflineNetwork").start()
+
+    def _offline_network_worker(self):
+        clear_local_arp_cache()
+        ok, message = configure_legacy_windows_hotspot(self.offline_ssid, self.offline_password)
+        if ok:
+            self.after(0, lambda: self.offline_network_ready(message))
+        else:
+            self.after(0, lambda: self.offline_network_failed(message))
+
+    def offline_network_ready(self, message):
+        self.offline_hotspot_started = True
+        self.offline_started_at = time.time()
+        clear_local_arp_cache()
+        self.local_ip = detect_hotspot_ip(self.local_ip)
+        self.offline_status = f"Rede privada ativa: {self.offline_ssid}"
+        self._refresh_local_url()
+        if self.current_page in ("overview", "connection"):
+            self.render_overview() if self.current_page == "overview" else self.render_connection()
+
+    def offline_network_failed(self, message):
+        self.offline_status = "O adaptador não permitiu criar a rede automaticamente. Use o botão de configuração do Windows."
+        if self.current_page in ("overview", "connection"):
+            self.render_overview() if self.current_page == "overview" else self.render_connection()
+
+    def poll_offline_connection(self):
+        global LAST_DEVICE_HEARTBEAT
+        app_wait = time.time() - self.offline_app_started_at if self.offline_app_started_at else 0
+        if self.offline_stage == "app" and app_wait >= 25 and (not LAST_DEVICE_HEARTBEAT or time.time() - LAST_DEVICE_HEARTBEAT > 12):
+            self.reset_offline_pairing("O dispositivo saiu da rede privada. Conecte-o novamente para continuar.")
+        stable_for = time.time() - self.offline_started_at if self.offline_started_at else 0
+        if self.offline_hotspot_started and self.offline_stage == "network" and stable_for >= 8 and hotspot_has_client(self.local_ip):
+            self.offline_stage = "app"
+            self.offline_app_started_at = time.time()
+            self.offline_status = "Dispositivo conectado à rede privada. Escaneie o QR Code de acesso."
+            self._refresh_local_url()
+            if self.current_page in ("overview", "connection"):
+                self.render_overview() if self.current_page == "overview" else self.render_connection()
+        self.after(1500, self.poll_offline_connection)
+
+    def reset_offline_pairing(self, message="Conecte o dispositivo à rede privada do computador."):
+        global ACTIVE_DEVICE_TOKEN, ACCESS_TOKEN_USED, LAST_DEVICE_HEARTBEAT, LAST_PHONE_SEEN
+        AUTHORIZED_DEVICES.clear()
+        ACTIVE_DEVICE_TOKEN = None
+        ACCESS_TOKEN_USED = False
+        LAST_DEVICE_HEARTBEAT = 0
+        LAST_PHONE_SEEN = 0
+        rotate_access_token()
+        save_session({})
+        self.session = {}
+        self.offline_stage = "network"
+        self.offline_app_started_at = 0
+        self.offline_status = message
+        clear_local_arp_cache()
+        self._refresh_local_url()
+        if self.current_page in ("overview", "connection"):
+            self.render_overview() if self.current_page == "overview" else self.render_connection()
+
+    def _refresh_local_url(self):
+        global PUBLIC_URL, PUBLIC_BASE_URL
+        PUBLIC_BASE_URL = f"http://{self.local_ip}:5000"
+        PUBLIC_URL = f"{PUBLIC_BASE_URL}/?access={ACCESS_TOKEN}"
+        self.url_text = PUBLIC_URL
+
+    def poll_local_url(self):
+        """Mantém o QR Code baseado no endereço privado desta estação."""
+        global PUBLIC_URL, PUBLIC_BASE_URL
+        current_base = f"http://{self.local_ip}:5000"
+        if PUBLIC_BASE_URL != current_base:
+            PUBLIC_BASE_URL = current_base
+            PUBLIC_URL = f"{PUBLIC_BASE_URL}/?access={ACCESS_TOKEN}"
+            self.url_text = PUBLIC_URL
+        self.after(1000, self.poll_local_url)
+
+    def close_app(self):
+        global ACTIVE_DEVICE_TOKEN, ACCESS_TOKEN_USED, LAST_DEVICE_HEARTBEAT, LAST_PHONE_SEEN
+        self.stop_all_gifs()
+        AUTHORIZED_DEVICES.clear()
+        ACTIVE_DEVICE_TOKEN = None
+        ACCESS_TOKEN_USED = False
+        LAST_DEVICE_HEARTBEAT = 0
+        LAST_PHONE_SEEN = 0
+        try:
+            save_session({})
+            if os.path.exists(SESSION_FILE):
+                os.remove(SESSION_FILE)
+        except OSError:
+            pass
+        for folder in (UPLOAD_FOLDER, OUTBOX_FOLDER):
+            try:
+                for name in os.listdir(folder):
+                    if name.endswith(".part"):
+                        os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
+        if getattr(self, "offline_hotspot_started", False):
+            stop_windows_mobile_hotspot()
+        self.destroy()
 
     def font(self, size=12, weight="normal"):
         return ctk.CTkFont(family="Poppins", size=size + 2, weight=weight)
@@ -460,7 +1033,7 @@ class ProfessionalApp(ctk.CTk):
         animate()
         label.gif_key = key
 
-    def load_qr_gif_frames(self, size=198):
+    def load_qr_gif_frames(self, size=178):
         key = f"qr:{self.url_text}:{size}"
         if key in self.qr_gif_frames:
             return self.qr_gif_frames[key]
@@ -469,7 +1042,7 @@ class ProfessionalApp(ctk.CTk):
             return []
         frames = []
         try:
-            qr_image = qrcode.make(self.url_text).convert("RGBA").resize((116, 116), Image.Resampling.NEAREST)
+            qr_image = qrcode.make(self.url_text).convert("RGBA").resize((108, 108), Image.Resampling.NEAREST)
             with Image.open(path) as gif:
                 for frame in ImageSequence.Iterator(gif):
                     base = frame.convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
@@ -592,7 +1165,7 @@ class ProfessionalApp(ctk.CTk):
 
     def render_overview(self):
         self.current_page = "overview"; self.clear_content()
-        self.page_header("Visão geral", "Gerencie a conexão e receba arquivos do seu iPhone.", "Escolher pasta", self.choose_folder, "Enviar para iPhone", self.add_files_for_iphone)
+        self.page_header("Visão geral", "Gerencie a conexão e receba arquivos do seu dispositivo móvel.", "Escolher pasta", self.choose_folder, "Enviar para dispositivo", self.add_files_for_device)
         stats = ctk.CTkFrame(self.content, fg_color="transparent"); stats.grid(row=1, column=0, sticky="ew", padx=31, pady=(0, 16))
         for i in range(4): stats.grid_columnconfigure(i, weight=1)
         self.stat_card(stats, 0, "STATUS", "Online", "Servidor pronto", "#4CDE04")
@@ -610,37 +1183,35 @@ class ProfessionalApp(ctk.CTk):
         if self.session.get("connected"):
             self.create_connected_card(card)
             return
-        ctk.CTkLabel(card,text="CONECTE SEU IPHONE",text_color=self.colors["muted"],font=self.font(10,"bold")).pack(anchor="w",padx=22,pady=(20,3))
-        ctk.CTkLabel(card,text="Escaneie para começar",text_color=self.colors["text"],font=self.font(18,"bold")).pack(anchor="w",padx=22)
-        ctk.CTkLabel(card,text="Abra a câmera e aponte para o QR Code.",text_color=self.colors["muted"],font=self.font(11)).pack(anchor="w",padx=22,pady=(3,7))
-        self.qr_stage=ctk.CTkFrame(card,width=210,height=210,fg_color="#FFFFFF",corner_radius=12); self.qr_stage.pack(pady=(0,6)); self.qr_stage.pack_propagate(False)
-        self.qr_canvas=Canvas(self.qr_stage,width=210,height=210,bg="#FFFFFF",highlightthickness=0); self.qr_canvas.pack()
+        network_stage = self.offline_stage == "network"
+        qr_target = f"WIFI:T:WPA;S:{self.offline_ssid};P:{self.offline_password};;" if network_stage else self.url_text
+        ctk.CTkLabel(card,text="1  CONECTE O DISPOSITIVO À REDE" if network_stage else "2  ABRA O NEXUSDROP",text_color=self.colors["muted"],font=self.font(10,"bold")).pack(anchor="w",padx=22,pady=(20,3))
+        ctk.CTkLabel(card,text="Escaneie para conectar ao PC" if network_stage else "Escaneie para abrir a transferência",text_color=self.colors["text"],font=self.font(18,"bold")).pack(anchor="w",padx=22)
+        ctk.CTkLabel(card,text=self.offline_status if network_stage else "O dispositivo já está na rede privada do computador.",text_color=self.colors["muted"],font=self.font(11),wraplength=400,justify="left").pack(anchor="w",padx=22,pady=(3,7))
+        self.qr_stage=ctk.CTkFrame(card,width=190,height=190,fg_color="#FFFFFF",corner_radius=12); self.qr_stage.pack(pady=(0,3)); self.qr_stage.pack_propagate(False)
+        self.qr_canvas=Canvas(self.qr_stage,width=190,height=190,bg="#FFFFFF",highlightthickness=0); self.qr_canvas.pack()
         self.qr_loading_label = ctk.CTkLabel(self.qr_stage, text="", fg_color="transparent")
         self.qr_loading_label.place(relx=0.5, rely=0.5, anchor="center")
-        if self.network_online is not False:
-            self.start_frames(self.qr_loading_label, self.load_qr_gif_frames(198), f"{id(self.qr_loading_label)}:qr", 70)
-        qr=ImageTk.PhotoImage(qrcode.make(self.url_text).resize((116,116), Image.Resampling.NEAREST)); self.qr_photo=qr
-        self.qr_image_id=self.qr_canvas.create_image(105,105,image=qr); self.qr_arc=self.qr_canvas.create_arc(7,7,203,203,start=0,extent=300,style="arc",width=4,outline=self.colors["blue"],state="hidden")
-        self.qr_status=ctk.CTkLabel(card,text="Aguardando reconhecimento\ndo iPhone...",text_color=self.colors["blue"],font=self.font(10,"bold"),wraplength=230,justify="center"); self.qr_status.pack(pady=(0,5))
-        line=ctk.CTkFrame(card,fg_color="transparent"); line.pack(fill="x",padx=20,pady=(0,17))
-        entry=ctk.CTkEntry(line,height=35,fg_color="#F5F3FF",border_color=self.colors["border"],text_color=self.colors["blue"],font=self.font(10,"bold")); entry.insert(0,self.url_text); entry.configure(state="readonly"); entry.pack(side="left",fill="x",expand=True,padx=(0,6))
-        ctk.CTkButton(line,text="Copiar",width=70,height=35,fg_color="#F0EEFF",hover_color="#E4DFFF",text_color=self.colors["blue"],font=self.font(10,"bold"),command=self.copy_url).pack(side="right")
+        if self.network_online is not False and not network_stage:
+            self.start_frames(self.qr_loading_label, self.load_qr_gif_frames(178), f"{id(self.qr_loading_label)}:qr", 70)
+        qr=ImageTk.PhotoImage(qrcode.make(qr_target).resize((108,108), Image.Resampling.NEAREST)); self.qr_photo=qr
+        self.qr_image_id=self.qr_canvas.create_image(95,95,image=qr); self.qr_arc=self.qr_canvas.create_arc(7,7,183,183,start=0,extent=300,style="arc",width=4,outline=self.colors["blue"],state="hidden")
+        self.qr_status=ctk.CTkLabel(card,text="Aguardando conexão à rede..." if network_stage else "Aguardando acesso...",text_color=self.colors["blue"],font=self.font(10,"bold"),wraplength=270,justify="center"); self.qr_status.pack(pady=(0,3))
+        ctk.CTkLabel(card,text="1. Conecte à rede  •  2. Escaneie para abrir" if network_stage else "🔒 Acesso local protegido por token",text_color=self.colors["green"],font=self.font(10,"bold"),wraplength=360,justify="center").pack(pady=(0,10))
 
     def create_connected_card(self, card):
-        ctk.CTkLabel(card, text="IPHONE CONECTADO", text_color=self.colors["green"], font=self.font(10, "bold")).pack(anchor="w", padx=22, pady=(28, 5))
+        ctk.CTkLabel(card, text="DISPOSITIVO CONECTADO", text_color=self.colors["green"], font=self.font(10, "bold")).pack(anchor="w", padx=22, pady=(28, 5))
         ctk.CTkLabel(card, text="Conexão reconhecida", text_color=self.colors["text"], font=self.font(20, "bold")).pack(anchor="w", padx=22)
         ctk.CTkLabel(card, text="Esta sessão está salva e pronta para receber novos arquivos.", text_color=self.colors["muted"], font=self.font(11), wraplength=400).pack(anchor="w", padx=22, pady=(7, 18))
         self.connected_gif_label = ctk.CTkLabel(card, text="", fg_color="transparent")
         self.connected_gif_label.pack(pady=5)
         self.start_gif(self.connected_gif_label, "concluido.gif", 112, 100)
         ctk.CTkLabel(card, text=f"Reconhecido em {self.session.get('time', 'agora')}", text_color=self.colors["green"], font=self.font(11, "bold")).pack(pady=(6, 2))
-        ctk.CTkLabel(card, text=f"IP do iPhone: {self.session.get('ip', 'desconhecido')}", text_color=self.colors["muted"], font=self.font(10)).pack()
-        ctk.CTkButton(card, text="Reconectar outro iPhone", width=190, height=36, fg_color=self.colors["blue"], hover_color=self.colors["blue_dark"], font=self.font(10, "bold"), command=self.reconnect).pack(pady=(18, 22))
+        ctk.CTkLabel(card, text=f"IP do dispositivo: {self.session.get('ip', 'desconhecido')}", text_color=self.colors["muted"], font=self.font(10)).pack()
+        ctk.CTkButton(card, text="Reconectar dispositivo", width=190, height=36, fg_color=self.colors["blue"], hover_color=self.colors["blue_dark"], font=self.font(10, "bold"), command=self.reconnect).pack(pady=(18, 22))
 
     def reconnect(self):
-        save_session({})
-        self.session = {}
-        self.render_connection()
+        self.reset_offline_pairing("Reconexão iniciada. Conecte o dispositivo à rede privada.")
 
     def create_activity_card(self,parent,column):
         card=self.make_card(parent); card.grid(row=0,column=column,sticky="nsew",padx=(10,0))
@@ -648,26 +1219,30 @@ class ProfessionalApp(ctk.CTk):
         send_box.pack(fill="x", padx=18, pady=(18, 12))
         send_top = ctk.CTkFrame(send_box, fg_color="transparent")
         send_top.pack(fill="x", padx=13, pady=(11, 3))
-        ctk.CTkLabel(send_top, text="ENVIAR PARA IPHONE", text_color=self.colors["blue"], font=self.font(10, "bold")).pack(side="left")
-        ctk.CTkButton(send_top, text="Selecionar arquivos", width=150, height=34, corner_radius=7, fg_color=self.colors["blue"], hover_color=self.colors["blue_dark"], text_color="#FFFFFF", font=self.font(10, "bold"), command=self.add_files_for_iphone).pack(side="right")
+        ctk.CTkLabel(send_top, text="ENVIAR PARA DISPOSITIVO", text_color=self.colors["blue"], font=self.font(10, "bold")).pack(side="left")
+        ctk.CTkButton(send_top, text="Selecionar arquivos", width=150, height=34, corner_radius=7, fg_color=self.colors["blue"], hover_color=self.colors["blue_dark"], text_color="#FFFFFF", font=self.font(10, "bold"), command=self.add_files_for_device).pack(side="right")
         self.pc_send_status = ctk.CTkLabel(send_box, text="Nenhum arquivo na fila", text_color=self.colors["muted"], font=self.font(10, "bold"))
         self.pc_send_status.pack(anchor="w", padx=13, pady=(4, 0))
-        self.pc_send_detail = ctk.CTkLabel(send_box, text="Escolha um ou vários arquivos para disponibilizar no iPhone.", text_color=self.colors["muted"], font=self.font(9), wraplength=390, justify="left")
+        self.pc_send_detail = ctk.CTkLabel(send_box, text="Escolha um ou vários arquivos para disponibilizar no dispositivo.", text_color=self.colors["muted"], font=self.font(9), wraplength=390, justify="left")
         self.pc_send_detail.pack(anchor="w", padx=13, pady=(2, 5))
         self.pc_send_bar = ctk.CTkProgressBar(send_box, height=6, corner_radius=3, mode="determinate", progress_color=self.colors["blue"], fg_color="#DAD4F5")
         self.pc_send_bar.set(0)
         self.pc_send_bar.pack(fill="x", padx=13, pady=(0, 11))
         ctk.CTkLabel(card,text="ATIVIDADE RECENTE",text_color=self.colors["muted"],font=self.font(10,"bold")).pack(anchor="w",padx=20,pady=(20,6))
         self.activity_title=ctk.CTkLabel(card,text="Tudo pronto para receber",text_color=self.colors["text"],font=self.font(17,"bold")); self.activity_title.pack(anchor="w",padx=20)
-        self.transfer_detail=ctk.CTkLabel(card,text="Aguardando um novo envio pelo iPhone.",text_color=self.colors["muted"],font=self.font(11),wraplength=440,justify="left"); self.transfer_detail.pack(anchor="w",padx=20,pady=(6,15))
+        self.transfer_detail=ctk.CTkLabel(card,text="Aguardando um novo envio pelo dispositivo.",text_color=self.colors["muted"],font=self.font(11),wraplength=440,justify="left"); self.transfer_detail.pack(anchor="w",padx=20,pady=(6,15))
+        self.receive_progress=ctk.CTkProgressBar(card,height=8,corner_radius=4,mode="determinate",progress_color=self.colors["blue"],fg_color="#DCD8F4")
+        self.receive_progress.set(0)
+        self.receive_progress.pack(fill="x",padx=20,pady=(0,8))
         self.transfer_status=ctk.CTkLabel(card,text="Aguardando envio",text_color=self.colors["blue"],font=self.font(11,"bold")); self.transfer_status.pack(anchor="w",padx=20,pady=5)
-        self.transfer_bar=ctk.CTkFrame(card,height=5,corner_radius=3,fg_color="#DCD8F4"); self.transfer_bar.pack(fill="x",padx=20,pady=(4,15)); self.transfer_bar.pack_propagate(False)
+        self.received_actions_frame=ctk.CTkFrame(card,fg_color="transparent")
+        self.received_actions_frame.pack(fill="x",padx=20,pady=(4,5))
         ctk.CTkButton(card,text="Abrir pasta de recebidos",image=self.load_asset("1.png",20),compound="left",height=37,fg_color=self.colors["blue"],hover_color=self.colors["blue_dark"],font=self.font(10,"bold"),command=self.open_folder).pack(fill="x",padx=20,pady=(10,20))
 
     def render_files(self):
         self.current_page = "files"
         self.clear_content()
-        self.page_header("Arquivos recebidos", "Veja e abra rapidamente os arquivos salvos pelo iPhone.", "Escolher pasta", self.choose_folder)
+        self.page_header("Arquivos recebidos", "Veja e abra rapidamente os arquivos salvos pelo dispositivo.", "Escolher pasta", self.choose_folder)
         body = ctk.CTkFrame(self.content, fg_color="transparent")
         body.grid(row=1, column=0, sticky="nsew", padx=31, pady=(0, 25))
         body.grid_columnconfigure(0, weight=1)
@@ -706,16 +1281,16 @@ class ProfessionalApp(ctk.CTk):
 
     def render_connection(self):
         self.current_page="connection"; self.clear_content()
-        self.page_header("Conexão e QR Code","Acompanhe em tempo real quando um iPhone reconhecer o endereço.","Copiar endereço",self.copy_url)
+        self.page_header("Conexão e QR Code","A conexão só pode ser iniciada pelo escaneamento do QR Code no dispositivo móvel.")
         area=ctk.CTkFrame(self.content,fg_color="transparent"); area.grid(row=1,column=0,sticky="nsew",padx=31,pady=(0,25)); area.grid_columnconfigure(0,weight=1); area.grid_columnconfigure(1,weight=1); area.grid_rowconfigure(0,weight=1)
         self.create_qr_card(area,0)
         info=self.make_card(area); info.grid(row=0,column=1,sticky="nsew",padx=(10,0))
         connected = bool(self.session.get("connected"))
         ctk.CTkLabel(info,text="MONITORAMENTO DA CONEXÃO",text_color=self.colors["muted"],font=self.font(10,"bold")).pack(anchor="w",padx=22,pady=(22,8))
-        ctk.CTkLabel(info,text="iPhone conectado" if connected else "Escaneie o QR Code pelo iPhone",text_color=self.colors["text"],font=self.font(18,"bold")).pack(anchor="w",padx=22)
+        ctk.CTkLabel(info,text="Dispositivo conectado" if connected else "Escaneie o QR Code pelo celular",text_color=self.colors["text"],font=self.font(18,"bold")).pack(anchor="w",padx=22)
         ctk.CTkLabel(info,text="Sessão reconhecida e pronta para novos envios." if connected else "Quando o celular abrir a página mobile, o programa mostrará uma confirmação verde e registrará o aparelho.",text_color=self.colors["muted"],font=self.font(11),wraplength=400,justify="left").pack(anchor="w",padx=22,pady=(7,18))
-        self.connection_state=ctk.CTkLabel(info,text="● iPhone conectado" if connected else "● Aguardando conexão",text_color=self.colors["green"] if connected else self.colors["blue"],font=self.font(13,"bold")); self.connection_state.pack(anchor="w",padx=22,pady=10)
-        for label,value in [("Endereço",self.url_text),("Porta","5000"),("Rede","Somente rede local")]:
+        self.connection_state=ctk.CTkLabel(info,text="● Dispositivo conectado" if connected else "● Aguardando conexão",text_color=self.colors["green"] if connected else self.colors["blue"],font=self.font(13,"bold")); self.connection_state.pack(anchor="w",padx=22,pady=10)
+        for label,value in [("Acesso","Somente por QR Code"),("Porta","5000"),("Rede","Somente dispositivo móvel autorizado")]:
             row=ctk.CTkFrame(info,fg_color="#FAF9FE",corner_radius=7,height=38); row.pack(fill="x",padx=22,pady=4); row.pack_propagate(False)
             ctk.CTkLabel(row,text=label,text_color=self.colors["muted"],font=self.font(10)).pack(side="left",padx=12); ctk.CTkLabel(row,text=value,text_color=self.colors["text"],font=self.font(10,"bold")).pack(side="right",padx=12)
 
@@ -727,7 +1302,7 @@ class ProfessionalApp(ctk.CTk):
         records=load_history()
         if not records:
             ctk.CTkLabel(scroll,text="Nenhuma atividade registrada ainda",text_color=self.colors["text"],font=self.font(17,"bold")).pack(pady=(45,5))
-            ctk.CTkLabel(scroll,text="Escaneie o QR Code e envie um arquivo pelo iPhone.",text_color=self.colors["muted"],font=self.font(11)).pack(pady=(0,45))
+            ctk.CTkLabel(scroll,text="Escaneie o QR Code e envie um arquivo pelo dispositivo móvel.",text_color=self.colors["muted"],font=self.font(11)).pack(pady=(0,45))
             return
         for record in reversed(records[-100:]):
             self.history_row(scroll,record)
@@ -746,8 +1321,9 @@ class ProfessionalApp(ctk.CTk):
     def render_tools(self):
         self.current_page="tools"; self.clear_content(); self.page_header("Ferramentas","Ações úteis para administrar sua estação.")
         body=ctk.CTkFrame(self.content,fg_color="transparent"); body.grid(row=1,column=0,sticky="nsew",padx=31,pady=(0,25)); body.grid_columnconfigure(0,weight=1); body.grid_columnconfigure(1,weight=1)
-        tools=[("Abrir pasta de recebidos","Acessar imediatamente o diretório atual",self.open_folder,self.colors["blue"]),("Copiar endereço local","Copiar o endereço para compartilhar na rede",self.copy_url,self.colors["green"]),("Abrir página mobile","Testar a tela do celular neste computador",self.open_mobile_local,self.colors["purple"]),("Exportar histórico","Salvar os registros em um arquivo TXT",self.export_history,self.colors["orange"]),
-                 ("Enviar arquivos para o iPhone","Escolher arquivos do PC para baixar no celular",self.add_files_for_iphone,self.colors["coral"])]
+        tools=[("Abrir pasta de recebidos","Acessar imediatamente o diretório atual",self.open_folder,self.colors["blue"]),("Exportar histórico","Salvar os registros em um arquivo TXT",self.export_history,self.colors["orange"]),
+                 ("Enviar arquivos para o dispositivo","Escolher arquivos do PC para baixar no dispositivo",self.add_files_for_device,self.colors["coral"]),
+                 ("Modo Seguro Offline","Criar uma rede Wi-Fi privada pelo PC, sem internet",self.open_offline_mode,self.colors["green"])]
         for i,(title,desc,action,color) in enumerate(tools):
             card=self.make_card(body); card.grid(row=i//2,column=i%2,sticky="ew",padx=6,pady=6)
             ctk.CTkLabel(card,text=title,text_color=self.colors["text"],font=self.font(14,"bold")).pack(anchor="w",padx=18,pady=(18,5))
@@ -775,8 +1351,40 @@ class ProfessionalApp(ctk.CTk):
         try: os.startfile(active_device_folder(UPLOAD_FOLDER))
         except Exception as error: self.show_notice(f"Não foi possível abrir: {error}")
 
-    def add_files_for_iphone(self):
-        selected = filedialog.askopenfilenames(title="Escolha os arquivos para enviar ao iPhone")
+    def open_received_file(self, filename):
+        safe_name = secure_filename(os.path.basename(filename))
+        folder = os.path.realpath(active_device_folder(UPLOAD_FOLDER))
+        target = os.path.realpath(os.path.join(folder, safe_name))
+        if not safe_name or os.path.commonpath([folder, target]) != folder or not os.path.isfile(target):
+            self.show_notice("Arquivo não encontrado")
+            return
+        try:
+            os.startfile(target)
+        except Exception as error:
+            self.show_notice(f"Não foi possível abrir o arquivo: {error}")
+
+    def show_received_file_action(self, filename):
+        if not hasattr(self, "received_actions_frame") or not self.received_actions_frame.winfo_exists():
+            return
+        row = ctk.CTkFrame(self.received_actions_frame, fg_color="#F1FAF6", corner_radius=8)
+        row.pack(fill="x", pady=3)
+        label = ctk.CTkLabel(row, text=f"Recebido: {filename}", text_color=self.colors["green"], font=self.font(10, "bold"), wraplength=300, justify="left", anchor="w")
+        label.pack(side="left", fill="x", expand=True, padx=(10, 5), pady=7)
+        ctk.CTkButton(row, text="Abrir", width=58, height=28, corner_radius=6, fg_color=self.colors["green"], hover_color="#167B5A", text_color="#FFFFFF", font=self.font(9, "bold"), command=lambda name=filename: self.open_received_file(name)).pack(side="right", padx=(3, 8), pady=5)
+        self.received_action_rows.append(row)
+
+        def remove_row():
+            try:
+                if row.winfo_exists():
+                    row.destroy()
+                if row in self.received_action_rows:
+                    self.received_action_rows.remove(row)
+            except Exception:
+                pass
+        self.after(6500, remove_row)
+
+    def add_files_for_device(self):
+        selected = filedialog.askopenfilenames(title="Escolha os arquivos para enviar ao dispositivo")
         if not selected:
             return
         if not ACTIVE_DEVICE_TOKEN:
@@ -787,7 +1395,7 @@ class ProfessionalApp(ctk.CTk):
         total = len(selected)
         if self.current_page == "overview" and hasattr(self, "pc_send_status"):
             self.pc_send_status.configure(text="Preparando arquivos...", text_color=self.colors["blue"])
-            self.pc_send_detail.configure(text=f"Copiando 0 de {total} arquivo(s) para a fila do iPhone.")
+            self.pc_send_detail.configure(text=f"Copiando 0 de {total} arquivo(s) para a fila do dispositivo.")
             self.pc_send_bar.set(0)
             self.update_idletasks()
         for source in selected:
@@ -797,7 +1405,7 @@ class ProfessionalApp(ctk.CTk):
                 stem, extension = os.path.splitext(name)
                 counter = 1
                 while os.path.exists(destination):
-                    destination = os.path.join(OUTBOX_FOLDER, f"{stem}_{counter}{extension}")
+                    destination = os.path.join(target_folder, f"{stem}_{counter}{extension}")
                     counter += 1
                 shutil.copy2(source, destination)
                 copied += 1
@@ -809,16 +1417,108 @@ class ProfessionalApp(ctk.CTk):
             except OSError as error:
                 print(f"Não foi possível adicionar {source}: {error}")
         if self.current_page == "overview" and hasattr(self, "pc_send_status"):
-            self.pc_send_status.configure(text=f"{copied} arquivo(s) pronto(s) para o iPhone", text_color=self.colors["green"] if copied else self.colors["coral"])
-            self.pc_send_detail.configure(text="Abra a página no iPhone e toque em Baixar na seção Arquivos do computador." if copied else "Nenhum arquivo foi adicionado.")
+            self.pc_send_status.configure(text=f"{copied} arquivo(s) pronto(s) para o dispositivo", text_color=self.colors["green"] if copied else self.colors["coral"])
+            self.pc_send_detail.configure(text="Abra a página no dispositivo e toque em Baixar na seção Arquivos do computador." if copied else "Nenhum arquivo foi adicionado.")
             self.pc_send_bar.set(1 if copied else 0)
-        self.show_notice(f"{copied} arquivo(s) disponível(is) no iPhone")
+        self.show_notice(f"{copied} arquivo(s) disponível(is) no dispositivo")
 
     def copy_url(self):
+        if not PUBLIC_URL:
+            self.show_notice("Endereço local indisponível")
+            return
         self.clipboard_clear(); self.clipboard_append(self.url_text); self.update(); self.show_notice("Endereço copiado")
 
     def open_mobile_local(self):
+        if not PUBLIC_URL:
+            self.show_notice("Endereço local indisponível")
+            return
         import webbrowser; webbrowser.open(self.url_text); self.show_notice("Página mobile aberta no navegador")
+
+    def open_hotspot_settings(self):
+        if os.name != "nt":
+            self.show_notice("Disponível somente no Windows")
+            return
+        try:
+            os.startfile("ms-settings:network-mobilehotspot")
+        except Exception as error:
+            self.show_notice(f"Não foi possível abrir as configurações: {error}")
+
+    def start_offline_mode(self, ssid_entry, password_entry, window, status_label, automatic=False):
+        ssid = ssid_entry.get().strip()
+        password = password_entry.get().strip()
+        if not ssid or len(password) < 8:
+            status_label.configure(text="Informe o nome da rede e uma senha WPA2 com pelo menos 8 caracteres.", text_color=self.colors["coral"])
+            return
+        status_label.configure(text="Ativando o Hotspot Móvel do Windows...", text_color=self.colors["blue"])
+        window.update_idletasks()
+        ok, message = configure_legacy_windows_hotspot(ssid, password)
+        if not ok:
+            if automatic:
+                status_label.configure(text="Este adaptador não permite configurar SSID e senha automaticamente.\nAbra as configurações do Windows, defina esses dados e clique novamente.", text_color=self.colors["coral"])
+                return
+            # Em drivers modernos o Hosted Network foi removido; nesse caso o
+            # Windows só permite iniciar o hotspot já configurado no sistema.
+            ok, message = start_windows_mobile_hotspot()
+        if not ok:
+            status_label.configure(text=f"Ativação automática indisponível neste adaptador.\n{message}\nAbra as configurações e ative o Hotspot Móvel.", text_color=self.colors["coral"])
+            return
+        self.offline_hotspot_started = True
+        time.sleep(1.0)
+        self.local_ip = detect_hotspot_ip(self.local_ip)
+        global PUBLIC_BASE_URL, PUBLIC_URL
+        PUBLIC_BASE_URL = f"http://{self.local_ip}:5000"
+        PUBLIC_URL = f"{PUBLIC_BASE_URL}/?access={ACCESS_TOKEN}"
+        self.url_text = PUBLIC_URL
+        wifi_payload = f"WIFI:T:WPA;S:{ssid};P:{password};;"
+        try:
+            wifi_image = qrcode.make(wifi_payload).convert("RGB").resize((210, 210), Image.Resampling.NEAREST)
+            app_image = qrcode.make(PUBLIC_URL).convert("RGB").resize((210, 210), Image.Resampling.NEAREST)
+            wifi_photo = ctk.CTkImage(light_image=wifi_image, dark_image=wifi_image, size=(210, 210))
+            app_photo = ctk.CTkImage(light_image=app_image, dark_image=app_image, size=(210, 210))
+            for child in window.winfo_children():
+                child.destroy()
+            ctk.CTkLabel(window, text="Modo Seguro Offline ativo", text_color=self.colors["green"], font=self.font(18, "bold")).pack(pady=(20, 4))
+            ctk.CTkLabel(window, text=f"Rede: {ssid}\nIP local do NexusDrop: {self.local_ip}:5000", text_color=self.colors["muted"], font=self.font(11), justify="center").pack(pady=(0, 12))
+            body = ctk.CTkFrame(window, fg_color="transparent"); body.pack(fill="both", expand=True, padx=20)
+            left = ctk.CTkFrame(body, fg_color="#F7F5FF", corner_radius=12); left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+            ctk.CTkLabel(left, text="1  ENTRAR NA REDE", text_color=self.colors["blue"], font=self.font(11, "bold")).pack(pady=(14, 5))
+            ctk.CTkLabel(left, image=wifi_photo, text="").pack(pady=5)
+            ctk.CTkLabel(left, text="Escaneie com a câmera para conectar o celular ao Wi-Fi do PC.", text_color=self.colors["muted"], font=self.font(9), wraplength=230, justify="center").pack(padx=12, pady=(3, 14))
+            right = ctk.CTkFrame(body, fg_color="#F7F5FF", corner_radius=12); right.pack(side="right", fill="both", expand=True, padx=(6, 0))
+            ctk.CTkLabel(right, text="2  ABRIR NEXUSDROP", text_color=self.colors["blue"], font=self.font(11, "bold")).pack(pady=(14, 5))
+            ctk.CTkLabel(right, image=app_photo, text="").pack(pady=5)
+            ctk.CTkLabel(right, text="Depois de entrar na rede, escaneie este QR Code.", text_color=self.colors["muted"], font=self.font(9), wraplength=230, justify="center").pack(padx=12, pady=(3, 14))
+            window._qr_refs = (wifi_photo, app_photo)
+            ctk.CTkButton(window, text="Fechar", width=130, height=34, fg_color=self.colors["blue"], hover_color=self.colors["blue_dark"], font=self.font(10, "bold"), command=window.destroy).pack(pady=(12, 18))
+            if self.current_page == "overview": self.render_overview()
+            elif self.current_page == "connection": self.render_connection()
+        except Exception as error:
+            status_label.configure(text=f"Não foi possível gerar os QR Codes: {error}", text_color=self.colors["coral"])
+
+    def open_offline_mode(self):
+        window = ctk.CTkToplevel(self)
+        window.title("Modo Seguro Offline — NexusDrop")
+        window.geometry("650x620")
+        window.minsize(620, 580)
+        window.transient(self)
+        window.grab_set()
+        ctk.CTkLabel(window, text="Criar conexão offline", text_color=self.colors["text"], font=self.font(20, "bold")).pack(pady=(22, 4))
+        ctk.CTkLabel(window, text="O celular entrará em uma rede Wi-Fi privada criada pelo Windows, sem internet ou Cloudflare.", text_color=self.colors["muted"], font=self.font(10), wraplength=560, justify="center").pack(pady=(0, 16))
+        form = ctk.CTkFrame(window, fg_color="#F7F5FF", corner_radius=12); form.pack(fill="x", padx=28, pady=5)
+        ctk.CTkLabel(form, text="Use exatamente o nome e a senha configurados no Hotspot Móvel do Windows.", text_color=self.colors["text"], font=self.font(10, "bold"), wraplength=530, justify="left").pack(anchor="w", padx=16, pady=(14, 10))
+        ctk.CTkLabel(form, text="Nome da rede Wi-Fi (SSID)", text_color=self.colors["muted"], font=self.font(10, "bold")).pack(anchor="w", padx=16)
+        ssid_entry = ctk.CTkEntry(form, height=35, placeholder_text="Ex.: NexusDrop-Offline"); ssid_entry.pack(fill="x", padx=16, pady=(4, 10)); ssid_entry.insert(0, "NexusDrop-Offline")
+        ctk.CTkLabel(form, text="Senha da rede Wi-Fi", text_color=self.colors["muted"], font=self.font(10, "bold")).pack(anchor="w", padx=16)
+        password_entry = ctk.CTkEntry(form, height=35, show="•", placeholder_text="Mínimo de 8 caracteres"); password_entry.pack(fill="x", padx=16, pady=(4, 14))
+        generated_ssid = f"NexusDrop-Offline-{secrets.token_hex(2).upper()}"
+        generated_password = f"Nexus-{secrets.token_urlsafe(10)}"
+        ssid_entry.delete(0, "end"); ssid_entry.insert(0, generated_ssid)
+        password_entry.insert(0, generated_password)
+        status = ctk.CTkLabel(window, text="Se ainda não configurou o hotspot, abra as configurações primeiro.", text_color=self.colors["muted"], font=self.font(10), wraplength=560, justify="center"); status.pack(pady=(14, 8))
+        buttons = ctk.CTkFrame(window, fg_color="transparent"); buttons.pack(pady=6)
+        ctk.CTkButton(buttons, text="Abrir configurações do Windows", width=220, height=36, fg_color="#EEEAFD", hover_color="#DED7FA", text_color=self.colors["blue"], font=self.font(10, "bold"), command=self.open_hotspot_settings).pack(side="left", padx=5)
+        ctk.CTkButton(buttons, text="Ativar e gerar QR Codes", width=190, height=36, fg_color=self.colors["blue"], hover_color=self.colors["blue_dark"], font=self.font(10, "bold"), command=lambda: self.start_offline_mode(ssid_entry, password_entry, window, status)).pack(side="left", padx=5)
+        self.after(350, lambda: self.start_offline_mode(ssid_entry, password_entry, window, status, automatic=True))
 
     def export_history(self):
         target=filedialog.asksaveasfilename(title="Exportar histórico",defaultextension=".txt",filetypes=[("Arquivo de texto","*.txt")])
@@ -876,23 +1576,15 @@ class ProfessionalApp(ctk.CTk):
             except (OSError, subprocess.SubprocessError):
                 pass
 
-        # Fallback para outros sistemas ou quando netsh não responder.
+        # Fallback sem consultar nenhum endereço externo.
         try:
-            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            probe.settimeout(0.8)
-            probe.connect(("8.8.8.8", 80))
-            address = probe.getsockname()[0]
-            probe.close()
-            return address not in ("", "0.0.0.0", "127.0.0.1")
+            addresses = socket.gethostbyname_ex(socket.gethostname())[2]
+            return any(address not in ("", "0.0.0.0", "127.0.0.1") for address in addresses)
         except OSError:
-            try:
-                address = socket.gethostbyname(socket.gethostname())
-                return address not in ("", "0.0.0.0", "127.0.0.1")
-            except OSError:
-                return False
+            return False
 
     def update_network_status(self):
-        online = self.is_network_online()
+        online = self.offline_hotspot_started or self.is_network_online()
         changed = online != self.network_online
         self.network_online = online
         if online:
@@ -904,7 +1596,7 @@ class ProfessionalApp(ctk.CTk):
                 self.server_dot_label.configure(text="")
             if hasattr(self, "qr_loading_label") and self.qr_loading_label.winfo_exists():
                 if changed:
-                    self.start_frames(self.qr_loading_label, self.load_qr_gif_frames(198), f"{id(self.qr_loading_label)}:qr", 70)
+                    self.start_frames(self.qr_loading_label, self.load_qr_gif_frames(178), f"{id(self.qr_loading_label)}:qr", 70)
                 self.qr_loading_label.configure(text="")
             if hasattr(self, "status_card") and self.status_card.winfo_exists():
                 self.status_card.configure(fg_color="#4CDE04")
@@ -932,21 +1624,35 @@ class ProfessionalApp(ctk.CTk):
             self.update_network_status()
         if LAST_PHONE_SEEN > self.last_phone_seen:
             self.last_phone_seen=LAST_PHONE_SEEN
-            self.session=load_session()
-            if self.session.get("connected") and self.current_page in ("overview", "connection"):
+            latest_session = load_session()
+            session_changed = latest_session.get("connected") != self.session.get("connected") or latest_session.get("time") != self.session.get("time")
+            self.session = latest_session
+            if session_changed and self.session.get("connected") and self.current_page in ("overview", "connection"):
                 if self.current_page == "overview": self.render_overview()
                 else: self.render_connection()
         if hasattr(self,"transfer_status") and TRANSFER_STATE.get("active"):
             percent = TRANSFER_STATE.get("percent", 0)
             amount = TRANSFER_STATE.get("files", 0)
+            if hasattr(self, "receive_progress"):
+                self.receive_progress.set(percent / 100)
             self.activity_title.configure(text="Recebendo arquivos...", text_color=self.colors["blue"])
             self.transfer_status.configure(text=f"Transferindo • {percent}%", text_color=self.colors["blue"])
-            self.transfer_detail.configure(text=f"O iPhone está enviando {amount} arquivo(s). {TRANSFER_STATE.get('name') or 'Aguarde a conclusão.'}")
+            current_name = TRANSFER_STATE.get("name") or "Aguarde a conclusão."
+            self.transfer_detail.configure(text=f"Recebendo {amount} arquivo(s) do dispositivo.\nArquivo atual: {current_name}")
         elif hasattr(self,"transfer_status") and LAST_UPLOAD_TIME > self.last_upload_time:
-            self.last_upload_time=LAST_UPLOAD_TIME; self.activity_title.configure(text="Arquivo recebido",text_color=self.colors["green"]); self.transfer_status.configure(text="Envio concluído",text_color=self.colors["green"]); self.transfer_detail.configure(text=LAST_UPLOADED_FILE or "Arquivo recebido")
+            self.last_upload_time=LAST_UPLOAD_TIME
+            if hasattr(self, "receive_progress"):
+                self.receive_progress.set(1)
+            self.activity_title.configure(text="Arquivo recebido",text_color=self.colors["green"])
+            self.transfer_status.configure(text="Envio concluído",text_color=self.colors["green"])
+            self.transfer_detail.configure(text=f"Recebido com sucesso:\n{LAST_UPLOADED_FILE or 'Arquivo recebido'}")
+            for filename in [item.strip() for item in (LAST_UPLOADED_FILE or "").split(",") if item.strip()]:
+                self.show_received_file_action(filename)
         elif hasattr(self,"transfer_status") and self.current_page=="overview":
+            if hasattr(self, "receive_progress"):
+                self.receive_progress.set(0)
             self.transfer_status.configure(text="Aguardando envio",text_color=self.colors["blue"])
-            self.transfer_detail.configure(text="Aguardando um novo envio pelo iPhone.")
+            self.transfer_detail.configure(text="Aguardando um novo envio pelo dispositivo.")
         # O anel agora é desenhado somente pelo carregando.gif.
         self.after(350,self.poll_server_state)
 
@@ -956,8 +1662,8 @@ class ProfessionalApp(ctk.CTk):
             self.qr_canvas.itemconfigure(self.qr_image_id,state="hidden"); self.qr_canvas.itemconfigure(self.qr_arc,state="hidden")
         except Exception:
             return
-        self.qr_complete_items=[self.qr_canvas.create_oval(58,58,152,152,fill=self.colors["green"],outline=self.colors["green"]),self.qr_canvas.create_line(79,105,98,124,fill="#FFFFFF",width=7),self.qr_canvas.create_line(98,124,134,84,fill="#FFFFFF",width=7)]
-        self.qr_status.configure(text="iPhone reconhecido",text_color=self.colors["green"])
+        self.qr_complete_items=[self.qr_canvas.create_oval(48,48,142,142,fill=self.colors["green"],outline=self.colors["green"]),self.qr_canvas.create_line(69,95,88,114,fill="#FFFFFF",width=7),self.qr_canvas.create_line(88,114,124,74,fill="#FFFFFF",width=7)]
+        self.qr_status.configure(text="Dispositivo reconhecido",text_color=self.colors["green"])
         if hasattr(self,"connection_state"): self.connection_state.configure(text="● Conexão reconhecida",text_color=self.colors["green"])
         self.after(2400,self.restore_qr)
 
@@ -965,7 +1671,7 @@ class ProfessionalApp(ctk.CTk):
         if not hasattr(self,"qr_canvas"): return
         try:
             for item in self.qr_complete_items: self.qr_canvas.delete(item)
-            self.qr_complete_items=[]; self.qr_canvas.itemconfigure(self.qr_image_id,state="normal"); self.qr_canvas.itemconfigure(self.qr_arc,state="hidden"); self.qr_status.configure(text="Aguardando reconhecimento\ndo iPhone...",text_color=self.colors["blue"])
+            self.qr_complete_items=[]; self.qr_canvas.itemconfigure(self.qr_image_id,state="normal"); self.qr_canvas.itemconfigure(self.qr_arc,state="hidden"); self.qr_status.configure(text="Aguardando reconhecimento\ndo dispositivo...",text_color=self.colors["blue"])
         except Exception:
             self.qr_complete_items=[]
 

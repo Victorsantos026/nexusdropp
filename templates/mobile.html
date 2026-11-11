@@ -224,7 +224,7 @@
 
         <section class="hero">
             <h1>Envie seus arquivos<br>para o computador</h1>
-            <p>Fotos, vídeos e documentos em qualidade original,<br>direto do iPhone pela rede local.</p>
+            <p>Fotos, vídeos e documentos em qualidade original,<br>direto do dispositivo pela rede local.</p>
         </section>
 
         <section class="content">
@@ -255,7 +255,7 @@
 
             <section class="card pc-files-card">
                 <div class="pc-files-head">
-                    <div><h2>Arquivos do computador</h2><p>Baixe neste iPhone os arquivos preparados para esta sessão.</p></div>
+                    <div><h2>Arquivos do computador</h2><p>Baixe neste dispositivo os arquivos preparados para esta sessão.</p></div>
                     <button class="refresh-button" id="refreshPcFiles" type="button" aria-label="Atualizar arquivos"><svg class="icon"><use href="#i-refresh"></use></svg></button>
                 </div>
                 <div class="pc-files-state" id="pcFilesState">Verificando arquivos disponíveis...</div>
@@ -312,9 +312,14 @@
         function reportProgress(active, percent, speed = "0 MB/s") {
             fetch("/transfer-status", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: { "Content-Type": "application/json", "X-Nexus-CSRF": getCsrfToken() },
                 body: JSON.stringify({ active, percent, speed, files: selectedFiles.length, name: selectedFiles.map(file => file.name).join(", ") })
             }).catch(() => {});
+        }
+
+        function getCsrfToken() {
+            const item = document.cookie.split("; ").find(value => value.startsWith("NEXUS_CSRF="));
+            return item ? decodeURIComponent(item.substring("NEXUS_CSRF=".length)) : "";
         }
 
         function renderFiles() {
@@ -327,8 +332,23 @@
                 const item = document.createElement("div");
                 item.className = "file-item";
                 const icon = file.type.startsWith("video/") ? "i-video" : file.type.startsWith("image/") ? "i-image" : "i-file";
-                item.innerHTML = `<div class="file-type"><svg class="icon"><use href="#${icon}"></use></svg></div><div class="file-name">${file.name}<div class="file-size">${formatBytes(file.size)}</div></div><button class="remove-file" type="button" aria-label="Remover arquivo"><svg class="icon"><use href="#i-close"></use></svg></button>`;
-                item.querySelector("button").addEventListener("click", () => {
+                const typeBox = document.createElement("div");
+                typeBox.className = "file-type";
+                typeBox.innerHTML = `<svg class="icon"><use href="#${icon}"></use></svg>`;
+                const info = document.createElement("div");
+                info.className = "file-name";
+                info.textContent = file.name;
+                const size = document.createElement("div");
+                size.className = "file-size";
+                size.textContent = formatBytes(file.size);
+                info.appendChild(size);
+                const remove = document.createElement("button");
+                remove.className = "remove-file";
+                remove.type = "button";
+                remove.setAttribute("aria-label", "Remover arquivo");
+                remove.innerHTML = `<svg class="icon"><use href="#i-close"></use></svg>`;
+                item.append(typeBox, info, remove);
+                remove.addEventListener("click", () => {
                     selectedFiles.splice(index, 1);
                     renderFiles();
                 });
@@ -374,12 +394,36 @@
         loadPcFiles();
         setInterval(loadPcFiles, 5000);
 
-        chooseButton.addEventListener("click", () => input.click());
-        input.addEventListener("change", () => {
-            selectedFiles = [...input.files];
+        function sendPresence() {
+            fetch("/presence", { cache: "no-store", credentials: "same-origin" })
+                .then(response => {
+                    if (!response.ok) throw new Error("offline");
+                })
+                .catch(() => {
+                    // O desktop detectará a ausência após alguns segundos e
+                    // voltará a mostrar o QR Code da rede privada.
+                });
+        }
+        sendPresence();
+        setInterval(sendPresence, 3000);
+
+        function handleFileSelection(event) {
+            const files = event.target.files ? [...event.target.files] : [];
+            if (!files.length) return;
+            selectedFiles = files;
             renderFiles();
             if (selectedFiles.length) setStatus("Arquivos prontos", "Confira a lista e toque em Enviar agora.");
+            // Garante que o Safari concluiu o repaint antes do usuário tocar em Enviar.
+            requestAnimationFrame(() => fileList.classList.add("visible"));
+        }
+
+        chooseButton.addEventListener("click", () => {
+            // Permite selecionar novamente o mesmo arquivo no iOS.
+            input.value = "";
+            input.click();
         });
+        input.addEventListener("change", handleFileSelection);
+        input.addEventListener("input", handleFileSelection);
         clearButton.addEventListener("click", () => {
             selectedFiles = [];
             input.value = "";
@@ -387,61 +431,78 @@
             setStatus("Pronto para receber", "Selecione arquivos para começar uma transferência.");
         });
 
-        sendButton.addEventListener("click", () => {
+        function uploadOneFile(file, index, total) {
+            return new Promise((resolve, reject) => {
+                const formData = new FormData();
+                formData.append("file", file);
+                const xhr = new XMLHttpRequest();
+                currentXhr = xhr;
+                xhr.open("POST", "/", true);
+                xhr.setRequestHeader("X-Nexus-CSRF", getCsrfToken());
+                let lastTime = Date.now();
+                let lastLoaded = 0;
+                xhr.upload.onprogress = event => {
+                    if (!event.lengthComputable) return;
+                    const filePercent = event.loaded / event.total * 100;
+                    const overallPercent = Math.round(((index + filePercent / 100) / total) * 100);
+                    progressFill.style.width = `${overallPercent}%`;
+                    percentText.textContent = `${overallPercent}%`;
+                    const now = Date.now();
+                    const seconds = (now - lastTime) / 1000;
+                    let speed = speedText.textContent;
+                    if (seconds > .3) {
+                        speed = `${((event.loaded - lastLoaded) / seconds / 1024 / 1024).toFixed(1)} MB/s`;
+                        speedText.textContent = speed;
+                        lastTime = now;
+                        lastLoaded = event.loaded;
+                    }
+                    progressText.textContent = `Enviando ${index + 1} de ${total}`;
+                    reportProgress(true, overallPercent, speed);
+                };
+                xhr.onload = () => {
+                    currentXhr = null;
+                    if (xhr.status === 200) resolve();
+                    else reject(new Error("Falha HTTP"));
+                };
+                xhr.onerror = () => {
+                    currentXhr = null;
+                    reject(new Error("Falha de conexão"));
+                };
+                xhr.send(formData);
+            });
+        }
+
+        sendButton.addEventListener("click", async () => {
             if (!selectedFiles.length || currentXhr) return;
-            const formData = new FormData();
-            selectedFiles.forEach(file => formData.append("file", file));
-            currentXhr = new XMLHttpRequest();
-            currentXhr.open("POST", "/", true);
+            const filesToSend = [...selectedFiles];
+            const total = filesToSend.length;
             progressCard.classList.add("visible");
-            setStatus("Enviando arquivos...", "Não feche esta tela durante a transferência.");
+            setStatus("Enviando arquivos...", "O computador será atualizado a cada arquivo concluído.");
             progressFill.style.width = "0%";
             percentText.textContent = "0%";
-            fileCountText.textContent = `${selectedFiles.length} arquivo(s)`;
-            reportProgress(true, 0);
-            let lastTime = Date.now();
-            let lastLoaded = 0;
-            currentXhr.upload.onprogress = event => {
-                if (!event.lengthComputable) return;
-                const percent = Math.round(event.loaded / event.total * 100);
-                progressFill.style.width = `${percent}%`;
-                percentText.textContent = `${percent}%`;
-                const now = Date.now();
-                const seconds = (now - lastTime) / 1000;
-                let speed = speedText.textContent;
-                if (seconds > .3) {
-                    speed = `${((event.loaded - lastLoaded) / seconds / 1024 / 1024).toFixed(1)} MB/s`;
-                    speedText.textContent = speed;
-                    lastTime = now;
-                    lastLoaded = event.loaded;
+            fileCountText.textContent = `${total} arquivo(s)`;
+            reportProgress(true, 0, "Preparando");
+            try {
+                for (let index = 0; index < total; index += 1) {
+                    await uploadOneFile(filesToSend[index], index, total);
                 }
-                progressText.textContent = `Enviando ${selectedFiles.length} arquivo(s)`;
-                reportProgress(true, percent, speed);
-            };
-            currentXhr.onload = () => {
-                if (currentXhr.status === 200) {
-                    progressFill.style.width = "100%";
-                    percentText.textContent = "100%";
-                    progressText.textContent = "Transferência concluída";
-                    speedText.textContent = "Concluído";
-                    reportProgress(false, 100, "Concluído");
-                    setStatus("Arquivos recebidos!", "Tudo foi salvo no computador com sucesso.");
-                    selectedFiles = [];
-                    input.value = "";
-                    renderFiles();
-                } else {
-                    setStatus("Não foi possível enviar", "Verifique a conexão e tente novamente.", "error");
-                }
-                currentXhr = null;
-            };
-            currentXhr.onerror = () => {
+                progressFill.style.width = "100%";
+                percentText.textContent = "100%";
+                progressText.textContent = "Transferência concluída";
+                speedText.textContent = "Concluído";
+                reportProgress(false, 100, "Concluído");
+                setStatus("Arquivos recebidos!", "Todos os arquivos foram salvos no computador.");
+                selectedFiles = [];
+                input.value = "";
+                renderFiles();
+            } catch (error) {
                 reportProgress(false, 0, "Falha");
-                setStatus("Falha na conexão", "Confira se o iPhone e o computador estão na mesma rede Wi-Fi.", "error");
+                setStatus("Falha na conexão", "O envio foi interrompido. Tente novamente.", "error");
                 uploadCard.classList.add("shake");
                 setTimeout(() => uploadCard.classList.remove("shake"), 400);
+            } finally {
                 currentXhr = null;
-            };
-            currentXhr.send(formData);
+            }
         });
     </script>
 </body>
